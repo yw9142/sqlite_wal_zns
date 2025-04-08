@@ -251,99 +251,6 @@
 
 #include "wal.h"
 
-/* ZNS SSD 관련 전역 변수 추가 */
-static char *znsWalPath = 0;                /* ZNS SSD 마운트 경로 */
-static int useZnsSsd = 0;                   /* ZNS SSD 사용 여부 (1:사용, 0:미사용) */
-static int znsZoneSize = 256 * 1024 * 1024; /* ZNS Zone 크기 (기본값 256MB) */
-
-/* ZNS SSD 경로 설정 함수 */
-void sqlite3WalSetZnsSsdPath(const char *zPath)
-{
-  if (znsWalPath)
-  {
-    sqlite3_free(znsWalPath);
-    znsWalPath = 0;
-  }
-  if (zPath && zPath[0])
-  {
-    znsWalPath = sqlite3_mprintf("%s", zPath);
-  }
-}
-
-/* 현재 설정된 ZNS SSD 경로 반환 */
-const char *sqlite3WalGetZnsSsdPath(void)
-{
-  return znsWalPath;
-}
-
-/* ZNS SSD 사용 여부 설정 */
-void sqlite3WalEnableZnsSsd(int enable)
-{
-  useZnsSsd = enable ? 1 : 0;
-}
-
-/* ZNS SSD 사용 여부 확인 */
-int sqlite3WalUseZnsSsd(void)
-{
-  return useZnsSsd;
-}
-
-/* 설정된 ZNS SSD 경로에 맞는 WAL 파일 경로 생성
-** 원래의 WAL 파일명을 ZNS SSD 경로에 위치시키고
-** 파일명만 그대로 유지하도록 함
-*/
-static char *walGetZnsWalPath(const char *zWalName)
-{
-  const char *zBase;
-  char *zPath;
-
-  if (!sqlite3WalUseZnsSsd() || !zWalName)
-    return 0;
-
-  /* 원본 파일명에서 기본 이름만 추출 */
-  zBase = strrchr(zWalName, '/');
-#ifdef _WIN32
-  {
-    const char *zBackslash = strrchr(zWalName, '\\');
-    if (!zBase || (zBackslash && zBackslash > zBase))
-      zBase = zBackslash;
-  }
-#endif
-  if (!zBase)
-    zBase = zWalName;
-  else
-    zBase++;
-
-  /* ZNS SSD 경로에 새 경로 생성 */
-  zPath = sqlite3_mprintf("%s/%s", znsWalPath, zBase);
-  return zPath;
-}
-
-/* ZNS Zone Reset 수행
-** ioctl(BLKZEROOUT) 명령을 사용하여 ZNS의 특정 Zone을 리셋함
-*/
-static int walResetZnsZone(sqlite3_file *pWalFd)
-{
-  int rc = SQLITE_OK;
-
-  /* ZNS 사용 시에만 동작 */
-  if (sqlite3WalUseZnsSsd())
-  {
-    i64 iOffset = 0;
-
-    /* BLKZEROOUT ioctl을 사용하여 Zone 리셋 */
-    rc = sqlite3OsFileControl(pWalFd, 0x40085607 /* BLKZEROOUT */, &iOffset);
-
-    /* 실패 시 fallback으로 truncate를 사용 */
-    if (rc != SQLITE_OK)
-    {
-      rc = sqlite3OsTruncate(pWalFd, 0);
-    }
-  }
-
-  return rc;
-}
-
 /*
 ** Trace output macros
 */
@@ -371,6 +278,7 @@ int sqlite3WalTrace = 0;
 */
 #define WAL_MAX_VERSION 3007000
 #define WALINDEX_MAX_VERSION 3007000
+#define WAL_WRITE_LOCK 0
 
 /*
 ** Index numbers for various locking bytes.   WAL_NREADER is the number
@@ -1856,34 +1764,18 @@ int sqlite3WalOpen(
     Wal **ppWal           /* OUT: Allocated Wal handle */
 )
 {
-  int rc;                /* Return Code */
-  Wal *pRet;             /* Object to allocate and return */
-  int flags;             /* Flags passed to OsOpen() */
-  char *zZnsWalName = 0; /* ZNS SSD WAL 파일 경로 */
+  int rc;    /* Return Code */
+  Wal *pRet; /* Object to allocate and return */
+  int flags; /* Flags passed to OsOpen() */
+  /* ZNS 관련 변수 제거됨: char *zZnsWalName = 0; */
 
   assert(zWalName && zWalName[0]);
   assert(pDbFd);
 
-  /* ZNS SSD를 사용하는 경우 WAL 파일 경로를 ZNS SSD 경로로 변경 */
-  if (sqlite3WalUseZnsSsd())
-  {
-    zZnsWalName = walGetZnsWalPath(zWalName);
-    if (zZnsWalName)
-    {
-      /* 원래 경로 대신 ZNS SSD 경로 사용 */
-      zWalName = zZnsWalName;
-    }
-  }
+  /* ZNS 경로 변경 로직 제거됨 */
+  /* The VFS layer (e.g., os_zns.c) will handle path redirection if needed */
 
-  /* Verify the values of various constants.  Any changes to the values
-  ** of these constants would result in an incompatible on-disk format
-  ** for the -shm file.  Any change that causes one of these asserts to
-  ** fail is a backward compatibility problem, even if the change otherwise
-  ** works.
-  **
-  ** This table also serves as a helpful cross-reference when trying to
-  ** interpret hex dumps of the -shm file.
-  */
+  /* Verify the values of various constants. */
   assert(48 == sizeof(WalIndexHdr));
   assert(40 == sizeof(WalCkptInfo));
   assert(120 == WALINDEX_LOCK_OFFSET);
@@ -1905,13 +1797,6 @@ int sqlite3WalOpen(
   assert(125 == WALINDEX_LOCK_OFFSET + WAL_READ_LOCK(2));
   assert(126 == WALINDEX_LOCK_OFFSET + WAL_READ_LOCK(3));
   assert(127 == WALINDEX_LOCK_OFFSET + WAL_READ_LOCK(4));
-
-  /* In the amalgamation, the os_unix.c and os_win.c source files come before
-  ** this source file.  Verify that the #defines of the locking byte offsets
-  ** in os_unix.c and os_win.c agree with the WALINDEX_LOCK_OFFSET value.
-  ** For that matter, if the lock offset ever changes from its initial design
-  ** value of 120, we need to know that so there is an assert() to check it.
-  */
 #ifdef WIN_SHM_BASE
   assert(WIN_SHM_BASE == WALINDEX_LOCK_OFFSET);
 #endif
@@ -1924,7 +1809,7 @@ int sqlite3WalOpen(
   pRet = (Wal *)sqlite3MallocZero(sizeof(Wal) + pVfs->szOsFile);
   if (!pRet)
   {
-    sqlite3_free(zZnsWalName);
+    /* sqlite3_free(zZnsWalName); // 제거됨 */
     return SQLITE_NOMEM_BKPT;
   }
 
@@ -1933,13 +1818,15 @@ int sqlite3WalOpen(
   pRet->pDbFd = pDbFd;
   pRet->readLock = -1;
   pRet->mxWalSize = mxWalSize;
-  pRet->zWalName = zWalName;
+  pRet->zWalName = zWalName; /* Pass original name to Wal struct */
   pRet->syncHeader = 1;
   pRet->padToSectorBoundary = 1;
   pRet->exclusiveMode = (bNoShm ? WAL_HEAPMEMORY_MODE : WAL_NORMAL_MODE);
 
-  /* Open file handle on the write-ahead log file. */
+  /* Open file handle on the write-ahead log file using the provided VFS. */
   flags = (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_WAL);
+  /* Pass the original zWalName. The registered VFS's xOpen will be called.
+   * If the VFS is 'zns', znsOpen() will handle redirection internally. */
   rc = sqlite3OsOpen(pVfs, zWalName, pRet->pWalFd, flags, &flags);
   if (rc == SQLITE_OK && flags & SQLITE_OPEN_READONLY)
   {
@@ -1951,7 +1838,7 @@ int sqlite3WalOpen(
     walIndexClose(pRet, 0);
     sqlite3OsClose(pRet->pWalFd);
     sqlite3_free(pRet);
-    sqlite3_free(zZnsWalName);
+    /* sqlite3_free(zZnsWalName); // 제거됨 */
   }
   else
   {
@@ -2692,16 +2579,10 @@ static void walLimitSize(Wal *pWal, i64 nMax)
   rx = sqlite3OsFileSize(pWal->pWalFd, &sz);
   if (rx == SQLITE_OK && (sz > nMax))
   {
-    if (sqlite3WalUseZnsSsd())
-    {
-      /* ZNS SSD의 경우 Zone Reset 사용 */
-      rx = walResetZnsZone(pWal->pWalFd);
-    }
-    else
-    {
-      /* 일반 SSD의 경우 기존과 같이 truncate 사용 */
-      rx = sqlite3OsTruncate(pWal->pWalFd, nMax);
-    }
+    /* Always call sqlite3OsTruncate. The VFS implementation (znsTruncate in
+     * os_zns.c) will handle the specific behavior (e.g., zone reset if
+     * nMax is 0 and ZNS is active). */
+    rx = sqlite3OsTruncate(pWal->pWalFd, nMax);
   }
   sqlite3EndBenignMalloc();
   if (rx)
@@ -4303,8 +4184,7 @@ int sqlite3WalSavepointUndo(Wal *pWal, u32 *aWalData)
 ** it sets pWal->hdr.mxFrame to 0. Otherwise, pWal->hdr.mxFrame is left
 ** unchanged.
 **
-** For ZNS SSD, this function might perform a Zone Reset operation if it's
-** determined that the WAL can be reset.
+** For ZNS SSD, the VFS's xTruncate(0) method handles the reset.
 **
 ** SQLITE_OK is returned if no error is encountered (regardless of whether
 ** or not pWal->hdr.mxFrame is modified). An SQLite error code is returned
@@ -4332,28 +4212,23 @@ static int walRestartLog(Wal *pWal)
   for (cnt = 1; cnt < WAL_NREADER; cnt++)
   {
     volatile WalCkptInfo *pInfo = walCkptInfo(pWal);
-    if (pInfo->aReadMark[cnt])
+    /* Check if reader mark is in use (not READMARK_NOT_USED) */
+    if (pInfo->aReadMark[cnt] != READMARK_NOT_USED)
     {
       return SQLITE_OK;
     }
   }
 
-  /* If we get to here, then log can be restarted. */
-  if (sqlite3WalUseZnsSsd())
-  {
-    /* ZNS SSD의 경우, Zone Reset을 사용하여 WAL 파일 초기화 */
-    rc = walResetZnsZone(pWal->pWalFd);
-  }
-  else
-  {
-    /* 일반 SSD의 경우 기존과 같이 빈 파일로 시작 */
-    rc = sqlite3OsTruncate(pWal->pWalFd, 0);
-  }
+  /* If we get to here, then log can be restarted. Call xTruncate(0)
+   * which will trigger the appropriate action in the VFS (e.g., zone reset
+   * for ZNS VFS). */
+  rc = sqlite3OsTruncate(pWal->pWalFd, 0); /* Always use OsTruncate */
 
   if (rc == SQLITE_OK)
   {
     pWal->hdr.mxFrame = 0;
-    pWal->hdr.szPage = pWal->szPage;
+    /* szPage should have been initialized correctly earlier */
+    assert(pWal->szPage != 0);
     pWal->truncateOnCommit = 1;
     walIndexWriteHdr(pWal);
   }
@@ -5186,3 +5061,87 @@ sqlite3_file *sqlite3WalFile(Wal *pWal)
 }
 
 #endif /* #ifndef SQLITE_OMIT_WAL */
+
+// --- ZNS Global State (예시 구현, wal.c 또는 다른 파일에 추가) ---
+#include <string.h> // For strdup, strcmp
+#include <stdlib.h> // For free
+
+static int g_zns_wal_enabled = 0;
+static char *g_zns_wal_path = NULL;
+static sqlite3_mutex *g_zns_state_mutex = NULL; // Protect global state access
+
+// Call once during initialization (e.g., before sqlite3_initialize)
+void sqlite3WalZnsGlobalInit()
+{
+  if (!g_zns_state_mutex)
+  {
+    g_zns_state_mutex = sqlite3_mutex_alloc(SQLITE_MUTEX_STATIC_MASTER + 1); // Choose appropriate static mutex
+  }
+}
+// Call during shutdown (e.g., after sqlite3_shutdown)
+void sqlite3WalZnsGlobalShutdown()
+{
+  sqlite3_mutex_enter(g_zns_state_mutex);
+  free(g_zns_wal_path);
+  g_zns_wal_path = NULL;
+  g_zns_wal_enabled = 0;
+  sqlite3_mutex_leave(g_zns_state_mutex);
+  // Note: Static mutexes are usually not freed.
+}
+
+int sqlite3WalUseZnsSsd(void)
+{
+  int enabled = 0;
+  if (!g_zns_state_mutex)
+    return 0; // Not initialized
+  sqlite3_mutex_enter(g_zns_state_mutex);
+  enabled = g_zns_wal_enabled;
+  sqlite3_mutex_leave(g_zns_state_mutex);
+  return enabled;
+}
+
+const char *sqlite3WalGetZnsSsdPath(void)
+{
+  const char *path = NULL;
+  if (!g_zns_state_mutex)
+    return NULL;
+  sqlite3_mutex_enter(g_zns_state_mutex);
+  // Return pointer, caller should not free or modify
+  path = g_zns_wal_path;
+  sqlite3_mutex_leave(g_zns_state_mutex);
+  return path;
+}
+
+void sqlite3WalSetZnsSsdPath(const char *zPath)
+{
+  if (!g_zns_state_mutex)
+    return;
+  sqlite3_mutex_enter(g_zns_state_mutex);
+  free(g_zns_wal_path); // Free existing path
+  g_zns_wal_path = NULL;
+  if (zPath && zPath[0])
+  {
+    g_zns_wal_path = strdup(zPath); // Duplicate the string
+    if (!g_zns_wal_path)
+    {
+      // Handle allocation failure - maybe log an error?
+      g_zns_wal_enabled = 0; // Disable if path alloc fails
+    }
+  }
+  sqlite3_mutex_leave(g_zns_state_mutex);
+}
+
+void sqlite3WalEnableZnsSsd(int enable)
+{
+  if (!g_zns_state_mutex)
+    return;
+  sqlite3_mutex_enter(g_zns_state_mutex);
+  g_zns_wal_enabled = (enable != 0);
+  if (!g_zns_wal_enabled)
+  { // If disabling, also clear path
+    free(g_zns_wal_path);
+    g_zns_wal_path = NULL;
+  }
+  sqlite3_mutex_leave(g_zns_state_mutex);
+}
+// --- End ZNS Global State ---

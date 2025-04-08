@@ -1,21 +1,22 @@
 /*
 ** 2023 ZNS SSD Optimized VFS for SQLite
 **
-** The author disclaims copyright to this source code.  In place of
-** a legal notice, here is a blessing:
+** This VFS attempts to store SQLite Write-Ahead Log (WAL) files onto
+** Zoned Namespace (ZNS) SSDs using a mounted zonefs filesystem.
+** It redirects WAL file operations to specific zone files and handles
+** ZNS constraints like sequential writes and zone resets.
 **
-**    May you do good and not evil.
-**    May you find forgiveness for yourself and forgive others.
-**    May you share freely, never taking more than you give.
-**
-*************************************************************************
-**
-** This file contains the VFS implementation for ZNS SSD optimized WAL mode.
-** It is designed to work with the existing WAL implementation in wal.c
-** but provides optimal write patterns for ZNS SSD devices.
-**
-** This VFS is based on the standard Unix VFS but adds special handling
-** for WAL files when they are located on ZNS SSD devices.
+** Key Features:
+** - Redirects WAL file creation/opening to pre-existing zone files within
+**   a specified zonefs mount point.
+** - Manages zone allocation using a simple zone manager.
+** - Implements write buffering for ZNS WAL files to handle potentially
+**   non-sequential writes from SQLite's WAL mechanism (e.g., checksum rewrites)
+**   by buffering in memory and flushing sequentially on sync.
+** - Translates Truncate(0) and Delete operations on ZNS WAL files to
+**   zone reset ioctls (BLKRESETZONE).
+** - Passes through operations for non-WAL files or when ZNS mode is disabled
+**   to the underlying default VFS.
 */
 
 #include "sqlite3.h"
@@ -30,12 +31,27 @@ SQLITE_EXTENSION_INIT1
 #include <sys/ioctl.h>
 #include <errno.h>
 #include <linux/fs.h>
-#include <linux/blkzoned.h>
+#include <linux/blkzoned.h> // Needed for BLKRESETZONE
 #include <dirent.h>
+#include <stdlib.h> // For malloc, realloc, free
+#include <stdio.h>  // For fprintf, stderr
+#include <assert.h> // For assert()
 
 /* ZNS 관련 상수 정의 - 시스템에 없을 경우 대체 정의 */
 #ifndef BLKRESETZONE
-#define BLKRESETZONE _IOW(0x12, 103, struct blk_zone_range)
+/* Fallback definition, might need adjustment based on actual kernel version */
+#warning "BLKRESETZONE not defined in headers, using fallback definition. Verify for your kernel."
+#define BLKRESETZONE _IOW(0x12, 131, struct blk_zone_range)
+#endif
+
+/* Define blk_zone_range if not defined (e.g., older headers) */
+#ifndef HAVE_STRUCT_BLK_ZONE_RANGE
+struct blk_zone_range
+{
+    __u64 sector;
+    __u64 nr_sectors;
+};
+#define HAVE_STRUCT_BLK_ZONE_RANGE 1
 #endif
 
 /* ZNS Zone 관리를 위한 구조체 */
@@ -44,8 +60,9 @@ struct zns_zone_manager
 {
     char *zZnsPath;       /* ZNS SSD 경로 (zonefs 마운트 포인트) */
     int nZones;           /* 사용 가능한 Zone의 수 */
-    int *aZoneState;      /* Zone 사용 상태 (0: 미사용, 1: 사용 중) */
+    int *aZoneState;      /* Zone 사용 상태 (0: Free, 1: Allocated) */
     char **aZoneFiles;    /* Zone 파일 경로 배열 */
+    char **aWalNames;     /* 각 Zone에 매핑된 WAL 파일명 (base name, NULL: 매핑 없음) */
     sqlite3_mutex *mutex; /* Zone 관리 뮤텍스 */
 };
 
@@ -58,10 +75,14 @@ static zns_zone_manager zoneManager = {0};
 /* Forward declarations */
 static sqlite3_vfs *pOrigVfs = 0; /* Pointer to the original VFS */
 static int znsVfsInit(sqlite3_vfs *);
+static char *znsGetFreeZoneFile(const char *zWalName); // Helper declaration
+static void znsZoneManagerDestroy(void);
 
-/* External declarations from wal.c */
+/* External declarations (must be defined elsewhere, e.g., in wal.c or main app) */
 extern int sqlite3WalUseZnsSsd(void);
 extern const char *sqlite3WalGetZnsSsdPath(void);
+extern void sqlite3WalSetZnsSsdPath(const char *zPath); // Assume these exist
+extern void sqlite3WalEnableZnsSsd(int enable);         // Assume these exist
 
 /*
 ** Custom file structure that wraps the standard Unix file
@@ -71,10 +92,17 @@ typedef struct zns_file zns_file;
 struct zns_file
 {
     sqlite3_file base;   /* Base class. Must be first */
-    sqlite3_file *pReal; /* The real underlying file */
-    char *zPath;         /* Copy of filename */
-    int isWal;           /* True if this is a WAL file */
-    int isZnsWal;        /* True if this WAL file is on ZNS SSD */
+    sqlite3_file *pReal; /* The real underlying file handle */
+    char *zPath;         /* Full path to the file being used (original or zone) */
+    int isWal;           /* True if this represents a WAL file */
+    int isZnsWal;        /* True if this WAL file is on ZNS SSD (using a zone file) */
+
+    /* --- ZNS WAL Buffering --- */
+    unsigned char *pBuffer; /* Write buffer for ZNS WAL */
+    sqlite3_int64 nBuffer;  /* Current size of data in buffer (logical size) */
+    sqlite3_int64 nAlloc;   /* Allocated size of pBuffer */
+    sqlite3_int64 iFlushed; /* Amount of data flushed to disk */
+    // sqlite3_mutex *pBufMutex; /* Mutex for buffer access (optional, likely not needed) */
 };
 
 /*
@@ -100,11 +128,31 @@ static int znsFetch(sqlite3_file *, sqlite3_int64 iOfst, int iAmt, void **pp);
 static int znsUnfetch(sqlite3_file *, sqlite3_int64 iOfst, void *p);
 
 /*
+** Method declarations for zns_vfs
+*/
+static int znsOpen(sqlite3_vfs *, const char *, sqlite3_file *, int, int *);
+static int znsDelete(sqlite3_vfs *, const char *, int);
+static int znsAccess(sqlite3_vfs *, const char *, int, int *);
+static int znsFullPathname(sqlite3_vfs *, const char *, int, char *);
+static void *znsDlOpen(sqlite3_vfs *, const char *);
+static void znsDlError(sqlite3_vfs *, int, char *);
+static void (*znsDlSym(sqlite3_vfs *, void *, const char *))(void);
+static void znsDlClose(sqlite3_vfs *, void *);
+static int znsRandomness(sqlite3_vfs *, int, char *);
+static int znsSleep(sqlite3_vfs *, int);
+static int znsCurrentTime(sqlite3_vfs *, double *);
+static int znsGetLastError(sqlite3_vfs *, int, char *);
+static int znsCurrentTimeInt64(sqlite3_vfs *, sqlite3_int64 *);
+// static int znsSetSystemCall(sqlite3_vfs*, const char*, sqlite3_syscall_ptr);
+// static sqlite3_syscall_ptr znsGetSystemCall(sqlite3_vfs*, const char*);
+// static const char *znsNextSystemCall(sqlite3_vfs*, const char*);
+
+/*
 ** The zns_file_methods object specifies the methods for
 ** the ZNS SSD VFS implementation
 */
 static const sqlite3_io_methods zns_file_methods = {
-    2,                        /* iVersion */
+    3,                        /* iVersion */
     znsClose,                 /* xClose */
     znsRead,                  /* xRead */
     znsWrite,                 /* xWrite */
@@ -133,113 +181,135 @@ struct zns_vfs
     sqlite3_vfs *pRealVfs; /* The real underlying VFS */
 };
 
-/* Helper function to check if a path is a WAL file on a ZNS device */
-static int isZnsWalFile(const char *zPath)
-{
-    /* Check if ZNS mode is enabled */
-    if (!sqlite3WalUseZnsSsd())
-        return 0;
-
-    /* Check if this is a WAL file (ends with -wal) */
-    int nPath = strlen(zPath);
-    if (nPath <= 4)
-        return 0;
-    if (sqlite3_strnicmp(&zPath[nPath - 4], "-wal", 4) != 0)
-        return 0;
-
-    /* Check if the WAL file might be on the ZNS SSD path */
-    const char *zZnsPath = sqlite3WalGetZnsSsdPath();
-    if (!zZnsPath)
-        return 0;
-
-    /* If the path starts with the ZNS path, it's a ZNS WAL file */
-    if (strncmp(zPath, zZnsPath, strlen(zZnsPath)) == 0)
-        return 1;
-
-    return 0;
-}
-
-/* Helper to convert regular WAL path to ZNS WAL path */
-static char *getZnsWalPath(const char *zPath)
-{
-    char *zResult = NULL;
-
-    if (!sqlite3WalUseZnsSsd() || !zPath)
-        return NULL;
-
-    /* Check if this is a WAL file */
-    int nPath = strlen(zPath);
-    if (nPath <= 4)
-        return NULL;
-    if (sqlite3_strnicmp(&zPath[nPath - 4], "-wal", 4) != 0)
-        return NULL;
-
-    /* Get the base filename without path */
-    const char *zBase = strrchr(zPath, '/');
-    if (!zBase)
-    {
-        zBase = zPath;
-    }
-    else
-    {
-        zBase++; /* Skip the / */
-    }
-
-    /* Combine ZNS path with base filename */
-    const char *zZnsPath = sqlite3WalGetZnsSsdPath();
-    if (!zZnsPath)
-        return NULL;
-
-    zResult = sqlite3_mprintf("%s/%s", zZnsPath, zBase);
-    return zResult;
-}
-
 /*
-** Reset a ZNS zone (or perform equivalent operation for the WAL file)
-** This is implementation-specific and would be replaced with actual
-** ZNS zone reset operations in a real implementation
+** Reset a ZNS zone using the BLKRESETZONE ioctl.
 */
 static int resetZnsZone(sqlite3_file *pFile)
 {
     zns_file *p = (zns_file *)pFile;
-    int fd, rc = SQLITE_OK;
-
-    if (!p->isZnsWal)
-        return SQLITE_OK;
-
-    /* Get the file descriptor */
-    rc = p->pReal->pMethods->xFileControl(p->pReal, SQLITE_FCNTL_FILE_DESCRIPTOR, &fd);
-    if (rc != SQLITE_OK)
-        return rc;
-
-    /* For ZNS SSD, we would typically use a zone reset operation.
-    ** This is hardware-specific, but might use an ioctl like:
-    ** ioctl(fd, ZNS_RESET_ZONE, &range);
-    **
-    ** For this example, we'll use BLKZEROOUT which is available on many Linux systems
-    ** and has a similar effect (clearing a range of blocks)
-    */
-#ifdef BLKZEROOUT
-    unsigned long long range[2] = {0, 0}; /* start offset, length */
+    int fd = -1, rc = SQLITE_OK;
     struct stat st;
+    struct blk_zone_range range = {0}; // Use the correct structure
 
-    /* Get the file size */
+    if (!p->isZnsWal || !p->pReal) // Check if it's a ZNS WAL and underlying file exists
+        return SQLITE_OK;          // Not applicable or already closed
+
+    /* Get the file descriptor from the underlying file */
+    /* Note: This might fail if the underlying VFS doesn't support SQLITE_FCNTL_FILE_DESCRIPTOR */
+    rc = p->pReal->pMethods->xFileControl(p->pReal, SQLITE_FCNTL_FILE_DESCRIPTOR, &fd);
+    if (rc != SQLITE_OK || fd < 0)
+    {
+        fprintf(stderr, "ZNS VFS Error: Could not get file descriptor for zone reset (rc=%d, fd=%d)\n", rc, fd);
+        /* Try opening the path directly as a fallback? Might have permission issues */
+        fd = open(p->zPath, O_RDWR);
+        if (fd < 0)
+        {
+            fprintf(stderr, "ZNS VFS Error: Could not open zone file %s directly for reset: %s\n", p->zPath, strerror(errno));
+            return SQLITE_IOERR_ACCESS; // Indicate failure to access for reset
+        }
+        // If opened directly, remember to close it
+    }
+
+    /* Get file size to determine the range (assuming one zone per file) */
     if (fstat(fd, &st) != 0)
     {
-        return SQLITE_IOERR;
+        fprintf(stderr, "ZNS VFS Error: fstat failed for fd %d (%s): %s\n", fd, p->zPath, strerror(errno));
+        rc = SQLITE_IOERR_FSTAT;
+        goto reset_zone_cleanup;
     }
 
-    /* Set the range to zero out the entire file */
-    range[1] = st.st_size;
+    /* For BLKRESETZONE, range usually just needs the start sector.
+     * Setting nr_sectors might be ignored or required depending on kernel.
+     * Let's assume sector 0 is sufficient for resetting the whole zone mapped to the file. */
+    range.sector = 0;
+    // range.nr_sectors = st.st_size / 512; // Typically 512 bytes/sector for ioctl
+    range.nr_sectors = 0; // Often ignored for zonefs files? Check zonefs/kernel docs. Let's try 0.
 
-    /* Issue the ioctl to zero out the range */
-    if (ioctl(fd, BLKZEROOUT, &range) != 0)
+    /* Issue the correct ioctl for ZNS zone reset */
+    if (ioctl(fd, BLKRESETZONE, &range) != 0)
     {
-        return SQLITE_IOERR;
+        fprintf(stderr, "ZNS VFS Error: BLKRESETZONE failed for fd %d (%s): %s\n", fd, p->zPath, strerror(errno));
+        rc = SQLITE_IOERR_TRUNCATE; // Map the error appropriately
+        goto reset_zone_cleanup;
     }
-#endif
 
+    rc = SQLITE_OK;
+    // fprintf(stderr, "ZNS VFS DEBUG: Successfully reset zone for %s\n", p->zPath);
+
+reset_zone_cleanup:
+    /* Close the fd ONLY if we opened it directly in the fallback */
+    if (rc != SQLITE_OK && fd >= 0 && p->pReal->pMethods->xFileControl(p->pReal, SQLITE_FCNTL_FILE_DESCRIPTOR, &fd) != SQLITE_OK)
+    {
+        close(fd);
+    }
+    else if (fd >= 0 && p->pReal->pMethods->xFileControl(p->pReal, SQLITE_FCNTL_FILE_DESCRIPTOR, &fd) != SQLITE_OK)
+    {
+        close(fd); // Close if opened directly even on success
+    }
+
+    return rc;
+}
+
+/* --- Helper: Ensure buffer capacity --- */
+static int znsEnsureBuffer(zns_file *p, sqlite3_int64 needed)
+{
+    if (needed > p->nAlloc)
+    {
+        // Calculate new size: at least needed, at least double current, at least 4k, align to 1k
+        sqlite3_int64 newAlloc = needed;
+        if (newAlloc < p->nAlloc * 2)
+            newAlloc = p->nAlloc * 2;
+        if (newAlloc < 4096)
+            newAlloc = 4096;
+        newAlloc = (newAlloc + 1023) & ~1023LL; // Align up to 1KB boundary
+
+        // fprintf(stderr, "ZNS VFS DEBUG: Reallocating buffer from %lld to %lld bytes (needed %lld)\n", p->nAlloc, newAlloc, needed);
+
+        unsigned char *pNew = sqlite3_realloc(p->pBuffer, (size_t)newAlloc); // Use size_t for alloc size
+        if (!pNew)
+        {
+            fprintf(stderr, "ZNS VFS Error: Failed to reallocate write buffer to %lld bytes\n", newAlloc);
+            return SQLITE_NOMEM;
+        }
+        p->pBuffer = pNew;
+        p->nAlloc = newAlloc;
+    }
     return SQLITE_OK;
+}
+
+/* --- Helper: Flush buffer content --- */
+static int znsFlushBuffer(zns_file *p)
+{
+    int rc = SQLITE_OK;
+    // Check if it's a ZNS WAL, buffer exists, and there's data to flush
+    if (!p->isZnsWal || !p->pBuffer || p->nBuffer <= p->iFlushed)
+    {
+        return SQLITE_OK;
+    }
+
+    sqlite3_int64 writeAmt = p->nBuffer - p->iFlushed;
+    sqlite3_int64 writeOfst = p->iFlushed;
+    unsigned char *writePtr = p->pBuffer + p->iFlushed;
+
+    if (writeAmt <= 0)
+        return SQLITE_OK; // Should be caught above, but double check
+
+    // fprintf(stderr, "ZNS VFS DEBUG: Flushing %lld bytes from offset %lld to %s\n", writeAmt, writeOfst, p->zPath);
+
+    rc = p->pReal->pMethods->xWrite(p->pReal, writePtr, (int)writeAmt, writeOfst);
+    if (rc == SQLITE_OK)
+    {
+        p->iFlushed = p->nBuffer;
+        // fprintf(stderr, "ZNS VFS DEBUG: Flush successful. iFlushed = %lld\n", p->iFlushed);
+    }
+    else
+    {
+        fprintf(stderr, "ZNS VFS Error: Failed to flush buffer (xWrite rc=%d, amt=%lld, ofst=%lld, file=%s, errno=%d %s)\n",
+                rc, writeAmt, writeOfst, p->zPath, errno, strerror(errno));
+        // How to handle flush failure? The buffer state is now inconsistent with disk.
+        // Maybe attempt recovery on next sync? For now, just report error.
+    }
+    return rc;
 }
 
 /*
@@ -248,20 +318,86 @@ static int resetZnsZone(sqlite3_file *pFile)
 static int znsClose(sqlite3_file *pFile)
 {
     zns_file *p = (zns_file *)pFile;
-    int rc;
+    int rc = SQLITE_OK;
+    const char *zBaseName = NULL;
+    int i;
 
-    /* Release the underlying file */
-    rc = p->pReal->pMethods->xClose(p->pReal);
+    // fprintf(stderr, "ZNS VFS DEBUG: Closing file %s (isZnsWal=%d)\n", p->zPath ? p->zPath : "<null path>", p->isZnsWal);
+
+    /* Flush any remaining buffer content for ZNS WAL (Optional, usually sync before close) */
+    // if (p->isZnsWal && p->pBuffer && p->nBuffer > p->iFlushed) {
+    //     fprintf(stderr, "ZNS VFS Warning: Flushing buffer on close for %s\n", p->zPath);
+    //     znsFlushBuffer(p); // Attempt flush, ignore error?
+    // }
+
+    /* Free the buffer if allocated */
+    if (p->isZnsWal && p->pBuffer)
+    {
+        sqlite3_free(p->pBuffer);
+        p->pBuffer = NULL;
+        p->nBuffer = 0;
+        p->nAlloc = 0;
+        p->iFlushed = 0;
+        // Mutex free if used:
+        // if (p->pBufMutex) {
+        //     sqlite3_mutex_free(p->pBufMutex);
+        //     p->pBufMutex = NULL;
+        // }
+    }
+
+    /* If this was a ZNS WAL file, mark the zone as free in the manager */
+    if (p->isZnsWal && zoneManager.zZnsPath && zoneManager.aZoneFiles && p->zPath)
+    {
+        // Extract the zone file name (not the original WAL name)
+        zBaseName = strrchr(p->zPath, '/');
+        zBaseName = zBaseName ? zBaseName + 1 : p->zPath; // Should be like "0001"
+
+        sqlite3_mutex_enter(zoneManager.mutex);
+        for (i = 0; i < zoneManager.nZones; i++)
+        {
+            // Compare against the actual zone file path stored in the manager
+            if (zoneManager.aZoneFiles[i] && strcmp(p->zPath, zoneManager.aZoneFiles[i]) == 0)
+            {
+                // fprintf(stderr, "ZNS VFS DEBUG: Releasing zone %s (index %d) in manager.\n", p->zPath, i);
+                if (zoneManager.aZoneState[i] == 1) // Only free if currently allocated
+                {
+                    zoneManager.aZoneState[i] = 0; /* Mark as Free */
+                    sqlite3_free(zoneManager.aWalNames[i]);
+                    zoneManager.aWalNames[i] = NULL;
+                }
+                else
+                {
+                    // fprintf(stderr, "ZNS VFS Warning: Zone %s (index %d) was already free when closing.\n", p->zPath, i);
+                }
+                break;
+            }
+        }
+        sqlite3_mutex_leave(zoneManager.mutex);
+    }
+
+    /* Close the underlying file handle */
+    if (p->pReal && p->pReal->pMethods)
+    {
+        rc = p->pReal->pMethods->xClose(p->pReal);
+    }
+    else
+    {
+        // Underlying file might not have been opened successfully
+        rc = SQLITE_OK; // Or return an error if p->pReal should always be valid here?
+    }
 
     /* Free the filename copy */
     sqlite3_free(p->zPath);
     p->zPath = NULL;
 
+    // Zero out the structure at the end (optional)
+    // memset(p, 0, sizeof(zns_file));
+
     return rc;
 }
 
 /*
-** Read data from a zns-file.
+** Read data from a zns-file. (Pass through - reads hit flushed data)
 */
 static int znsRead(
     sqlite3_file *pFile,
@@ -270,11 +406,30 @@ static int znsRead(
     sqlite3_int64 iOfst)
 {
     zns_file *p = (zns_file *)pFile;
-    return p->pReal->pMethods->xRead(p->pReal, zBuf, iAmt, iOfst);
+    int rc;
+
+    // fprintf(stderr, "ZNS VFS DEBUG: Reading %d bytes from offset %lld in %s (flushed=%lld)\n", iAmt, iOfst, p->zPath, p->iFlushed);
+
+    /* Reads should only happen up to the flushed size for ZNS WAL */
+    /* SQLite WAL reader should normally not read beyond the last commit point (which implies flushed data) */
+    /* However, to be safe, let's just pass through. The underlying file system */
+    /* should handle reads correctly up to the actual write pointer. */
+    if (p->isZnsWal && iOfst + iAmt > p->iFlushed)
+    {
+        // This might happen if reading data written in the current uncommitted Tx.
+        // Allowing pass-through read seems necessary.
+        // fprintf(stderr, "ZNS VFS Warning: Read request (%lld + %d) potentially beyond flushed size (%lld) for %s. Passing through.\n", iOfst, iAmt, p->iFlushed, p->zPath);
+    }
+
+    rc = p->pReal->pMethods->xRead(p->pReal, zBuf, iAmt, iOfst);
+    // if( rc!=SQLITE_OK && rc!=SQLITE_IOERR_SHORT_READ ){
+    //     fprintf(stderr, "ZNS VFS Error: Underlying xRead failed (rc=%d, amt=%d, ofst=%lld, file=%s, errno=%d %s)\n", rc, iAmt, iOfst, p->zPath, errno, strerror(errno));
+    // }
+    return rc;
 }
 
 /*
-** Write data to a zns-file.
+** Write data to a zns-file. (Uses Buffering for ZNS WAL)
 */
 static int znsWrite(
     sqlite3_file *pFile,
@@ -283,53 +438,55 @@ static int znsWrite(
     sqlite3_int64 iOfst)
 {
     zns_file *p = (zns_file *)pFile;
-    int rc;
+    int rc = SQLITE_OK;
 
-    /* ZNS SSD WAL 파일의 경우 특별 처리 */
+    /* For ZNS WAL files, use the buffer */
     if (p->isZnsWal)
     {
-        int fd;
-        i64 iSize;
+        // Optional: Add mutex for buffer access
+        // sqlite3_mutex_enter(p->pBufMutex);
 
-        /* 파일 디스크립터 얻기 */
-        rc = p->pReal->pMethods->xFileControl(p->pReal, SQLITE_FCNTL_FILE_DESCRIPTOR, &fd);
+        // fprintf(stderr, "ZNS VFS DEBUG: Write request %d bytes at offset %lld to %s (buffer size %lld)\n", iAmt, iOfst, p->zPath, p->nBuffer);
+
+        /* Ensure buffer has enough capacity */
+        rc = znsEnsureBuffer(p, iOfst + iAmt);
         if (rc != SQLITE_OK)
-            return rc;
-
-        /* 현재 파일 크기 확인 */
-        rc = p->pReal->pMethods->xFileSize(p->pReal, &iSize);
-        if (rc != SQLITE_OK)
-            return rc;
-
-        /* ZNS에서는 항상 순차적 쓰기가 필요함 */
-        if (iOfst != iSize)
         {
-            /* WAL 파일의 헤더 업데이트 등을 처리하기 위한 특별 케이스 */
-            if (iOfst < 32)
-            { /* WAL 헤더 크기는 32바이트 */
-                /* WAL 헤더 쓰기는 허용 */
-                return p->pReal->pMethods->xWrite(p->pReal, zBuf, iAmt, iOfst);
-            }
-
-            /* 그 외에는 순차 쓰기만 허용 - iOfst가 현재 크기와 다르면 에러 */
-            return SQLITE_IOERR_WRITE;
+            // sqlite3_mutex_leave(p->pBufMutex);
+            return rc;
         }
 
-        /* 순차 쓰기 - zonefs에서는 항상 append 모드로 쓰기 */
-        rc = p->pReal->pMethods->xWrite(p->pReal, zBuf, iAmt, iOfst);
-
-        /* Zone이 가득 찼을 때 처리 */
-        if (rc == SQLITE_FULL || rc == SQLITE_IOERR_WRITE)
+        /* Check for sequential append or valid overwrite *within the buffer* */
+        /* A write offset must be <= the current buffer size */
+        if (iOfst > p->nBuffer)
         {
-            /* 여기에서 새로운 Zone을 할당하는 로직을 구현할 수 있음 */
-            /* 이 구현에서는 상위 레이어(WAL)가 에러를 받아 체크포인트를 수행하도록 함 */
+            fprintf(stderr, "ZNS VFS Error: Attempted non-sequential write (gap) to ZNS WAL buffer. Offset %lld > Buffer Size %lld in %s\n", iOfst, p->nBuffer, p->zPath);
+            // sqlite3_mutex_leave(p->pBufMutex);
+            return SQLITE_IOERR_WRITE; // Disallow gaps
         }
 
-        return rc;
+        /* Copy data into the buffer */
+        memcpy(p->pBuffer + iOfst, zBuf, iAmt);
+
+        /* Update logical buffer size if appending */
+        if (iOfst + iAmt > p->nBuffer)
+        {
+            p->nBuffer = iOfst + iAmt;
+        }
+
+        // fprintf(stderr, "ZNS VFS DEBUG: Buffered write successful. New buffer size %lld for %s\n", p->nBuffer, p->zPath);
+
+        // sqlite3_mutex_leave(p->pBufMutex);
+        return SQLITE_OK; // Data is buffered, actual write happens on sync/flush
     }
 
-    /* ZNS가 아닌 파일은 원래 VFS로 처리 */
-    return p->pReal->pMethods->xWrite(p->pReal, zBuf, iAmt, iOfst);
+    /* For non-ZNS files, pass through to the real VFS */
+    // fprintf(stderr, "ZNS VFS DEBUG: Passing through write %d bytes at offset %lld to %s\n", iAmt, iOfst, p->zPath);
+    rc = p->pReal->pMethods->xWrite(p->pReal, zBuf, iAmt, iOfst);
+    // if( rc!=SQLITE_OK ){
+    //     fprintf(stderr, "ZNS VFS Error: Underlying passthrough xWrite failed (rc=%d, amt=%d, ofst=%lld, file=%s, errno=%d %s)\n", rc, iAmt, iOfst, p->zPath, errno, strerror(errno));
+    // }
+    return rc;
 }
 
 /*
@@ -338,287 +495,354 @@ static int znsWrite(
 static int znsTruncate(sqlite3_file *pFile, sqlite3_int64 size)
 {
     zns_file *p = (zns_file *)pFile;
+    int rc = SQLITE_OK;
 
-    /* For ZNS WAL files, truncate might be implemented with zone reset */
+    // fprintf(stderr, "ZNS VFS DEBUG: Truncate request size=%lld for %s (isZnsWal=%d)\n", size, p->zPath, p->isZnsWal);
+
+    /* For ZNS WAL files, truncate(0) means reset the zone and buffer */
     if (p->isZnsWal && size == 0)
     {
-        int rc = resetZnsZone(pFile);
+        fprintf(stderr, "ZNS VFS INFO: Truncate(0) called for ZNS WAL %s. Resetting zone and buffer.\n", p->zPath);
+
+        // Reset buffer state
+        // sqlite3_mutex_enter(p->pBufMutex); // Optional mutex
+        p->nBuffer = 0;
+        p->iFlushed = 0;
+        // Optionally free and reallocate buffer to minimum size, or just keep allocated buffer?
+        // Keeping it might be slightly faster if immediately reused.
+        // sqlite3_free(p->pBuffer); p->pBuffer = NULL; p->nAlloc = 0;
+        // sqlite3_mutex_leave(p->pBufMutex);
+
+        // Reset the physical zone
+        rc = resetZnsZone(pFile);
         if (rc != SQLITE_OK)
-            return rc;
+        {
+            fprintf(stderr, "ZNS VFS Error: resetZnsZone failed during Truncate(0) for %s (rc=%d)\n", p->zPath, rc);
+            // Even if reset fails, buffer is reset. Should we restore buffer state? Probably not.
+        }
+        return rc;
     }
 
+    /* Truncating to non-zero size for ZNS WAL */
+    if (p->isZnsWal)
+    {
+        fprintf(stderr, "ZNS VFS Warning: Truncate to non-zero size (%lld) requested for ZNS WAL file %s. Operation ignored.\n", size, p->zPath);
+        // Cannot truncate a zone to arbitrary size. Best to ignore and return OK.
+        return SQLITE_OK;
+    }
+
+    /* Pass through for non-ZNS files */
     return p->pReal->pMethods->xTruncate(p->pReal, size);
 }
 
 /*
-** Sync a zns-file.
+** Sync a zns-file. (Flushes buffer for ZNS WAL)
 */
 static int znsSync(sqlite3_file *pFile, int flags)
 {
     zns_file *p = (zns_file *)pFile;
+    int rc = SQLITE_OK;
 
-    /* For ZNS WAL files, fsync might be unnecessary due to
-    ** ZNS write semantics, but we still call the underlying fsync
-    ** for safety unless we're certain about the hardware behavior
-    */
+    // fprintf(stderr, "ZNS VFS DEBUG: Sync request flags=0x%x for %s (isZnsWal=%d)\n", flags, p->zPath, p->isZnsWal);
+
+    /* For ZNS WAL files, flush the buffer then sync the underlying file */
+    if (p->isZnsWal)
+    {
+        // sqlite3_mutex_enter(p->pBufMutex); // Optional mutex
+        rc = znsFlushBuffer(p); // Write buffered data to disk first
+        if (rc == SQLITE_OK)
+        {
+            // Only call underlying sync if flush was successful
+            // fprintf(stderr, "ZNS VFS DEBUG: Flushing successful for %s, calling underlying sync.\n", p->zPath);
+            rc = p->pReal->pMethods->xSync(p->pReal, flags);
+            if (rc != SQLITE_OK)
+            {
+                fprintf(stderr, "ZNS VFS Error: Underlying xSync failed for %s (rc=%d, errno=%d %s)\n", p->zPath, rc, errno, strerror(errno));
+            }
+        }
+        else
+        {
+            fprintf(stderr, "ZNS VFS Error: Flush buffer failed during sync for %s (rc=%d). Sync aborted.\n", p->zPath, rc);
+        }
+        // sqlite3_mutex_leave(p->pBufMutex);
+        return rc;
+    }
+
+    /* Pass through for non-ZNS files */
     return p->pReal->pMethods->xSync(p->pReal, flags);
 }
 
 /*
-** Return the current file-size of a zns-file.
+** Get file size of a zns-file. (Returns buffered size for ZNS WAL)
 */
 static int znsFileSize(sqlite3_file *pFile, sqlite3_int64 *pSize)
 {
     zns_file *p = (zns_file *)pFile;
+
+    /* For ZNS WAL files, return the logical (buffered) size */
+    if (p->isZnsWal)
+    {
+        // sqlite3_mutex_enter(p->pBufMutex); // Optional mutex
+        *pSize = p->nBuffer;
+        // sqlite3_mutex_leave(p->pBufMutex);
+        // fprintf(stderr, "ZNS VFS DEBUG: Reporting file size %lld for ZNS WAL %s\n", *pSize, p->zPath);
+        return SQLITE_OK;
+    }
+
+    /* Pass through for non-ZNS files */
     return p->pReal->pMethods->xFileSize(p->pReal, pSize);
 }
 
-/*
-** Lock a zns-file.
-*/
+/* --- Pass-through methods --- */
+
 static int znsLock(sqlite3_file *pFile, int eLock)
 {
     zns_file *p = (zns_file *)pFile;
     return p->pReal->pMethods->xLock(p->pReal, eLock);
 }
-
-/*
-** Unlock a zns-file.
-*/
 static int znsUnlock(sqlite3_file *pFile, int eLock)
 {
     zns_file *p = (zns_file *)pFile;
     return p->pReal->pMethods->xUnlock(p->pReal, eLock);
 }
-
-/*
-** Check if another file-handle holds a RESERVED lock on a zns-file.
-*/
 static int znsCheckReservedLock(sqlite3_file *pFile, int *pResOut)
 {
     zns_file *p = (zns_file *)pFile;
     return p->pReal->pMethods->xCheckReservedLock(p->pReal, pResOut);
 }
-
-/*
-** File control method. For custom operations on a zns-file.
-*/
 static int znsFileControl(sqlite3_file *pFile, int op, void *pArg)
 {
     zns_file *p = (zns_file *)pFile;
-    int rc;
-
-    /* Handle ZNS-specific operations */
-    switch (op)
-    {
-    /* Add custom ZNS-specific file control operations here */
-
-    /* Handle WAL-specific operations */
-    case SQLITE_FCNTL_WAL_CHECKPOINT:
-        /* Special handling for WAL checkpoints on ZNS SSD */
-        if (p->isZnsWal)
-        {
-            /* Prepare for checkpoint (eg: zone management operations) */
-        }
-        break;
-
-    case SQLITE_FCNTL_JOURNAL_POINTER:
-        /* Handle journal pointer operations for ZNS */
-        break;
-    }
-
-    /* Pass through to the real VFS */
-    rc = p->pReal->pMethods->xFileControl(p->pReal, op, pArg);
-
-    return rc;
+    /* Intercept FCNTL_FILE_DESCRIPTOR for resetZnsZone fallback? */
+    // if (op == SQLITE_FCNTL_FILE_DESCRIPTOR) {
+    //     // Let the original VFS handle it if it can
+    // }
+    /* Intercept specific controls if needed, e.g., ZNS specific hints */
+    // if (p->isZnsWal && op == XYZ_ZNS_HINT) { ... }
+    return p->pReal->pMethods->xFileControl(p->pReal, op, pArg);
 }
-
-/*
-** Return the sector-size in bytes for a zns-file.
-*/
 static int znsSectorSize(sqlite3_file *pFile)
 {
     zns_file *p = (zns_file *)pFile;
-
-    /* For ZNS SSDs, we might want to return the zone size or sector size */
-    if (p->isZnsWal)
-    {
-        /* In a real implementation, we would query the actual ZNS zone size */
-        /* For now, just return a larger value typical for ZNS zones */
-        return 4096; /* or larger, depending on actual ZNS hardware */
-    }
-
     return p->pReal->pMethods->xSectorSize(p->pReal);
 }
-
-/*
-** Return the device characteristics for a zns-file.
-*/
 static int znsDeviceCharacteristics(sqlite3_file *pFile)
 {
     zns_file *p = (zns_file *)pFile;
-
-    /* For ZNS WAL files, add special device characteristics */
+    int characteristics = p->pReal->pMethods->xDeviceCharacteristics(p->pReal);
+    /* Advertise sequential-only for ZNS WAL files? */
     if (p->isZnsWal)
     {
-        /* ZNS writes are append-only within a zone and zones can be reset */
-        return p->pReal->pMethods->xDeviceCharacteristics(p->pReal) |
-               SQLITE_IOCAP_SEQUENTIAL |
-               SQLITE_IOCAP_SAFE_APPEND;
-    }
+        /* SQLITE_IOCAP_SEQUENTIAL tells SQLite WAL not to bother with checksum rewrites,
+           which simplifies things but might subtly change behavior or assumptions.
+           Let's NOT advertise sequential for now, rely on buffering to handle rewrites. */
+        // characteristics |= SQLITE_IOCAP_SEQUENTIAL;
 
-    return p->pReal->pMethods->xDeviceCharacteristics(p->pReal);
+        /* ZNS zones might inherently have power-safe overwrite properties IF writes */
+        /* are guaranteed to land sequentially and zonefs/device handles metadata safely.*/
+        /* It's safer NOT to assume this unless the underlying hardware guarantees it. */
+        // characteristics |= SQLITE_IOCAP_POWERSAFE_OVERWRITE;
+    }
+    return characteristics;
 }
 
-/*
-** The shared memory related methods - mostly pass-through to the real VFS
-*/
-static int znsShmMap(
-    sqlite3_file *pFile,
-    int iPg,
-    int pgsz,
-    int isWrite,
-    void volatile **pp)
+/* --- SHM methods (Pass-through, SHM is not on ZNS) --- */
+
+static int znsShmMap(sqlite3_file *pFile, int iPg, int pgsz, int bExtend, void volatile **pp)
 {
     zns_file *p = (zns_file *)pFile;
-    return p->pReal->pMethods->xShmMap(p->pReal, iPg, pgsz, isWrite, pp);
+    return p->pReal->pMethods->xShmMap(p->pReal, iPg, pgsz, bExtend, pp);
 }
-
 static int znsShmLock(sqlite3_file *pFile, int offset, int n, int flags)
 {
     zns_file *p = (zns_file *)pFile;
     return p->pReal->pMethods->xShmLock(p->pReal, offset, n, flags);
 }
-
 static void znsShmBarrier(sqlite3_file *pFile)
 {
     zns_file *p = (zns_file *)pFile;
     p->pReal->pMethods->xShmBarrier(p->pReal);
 }
-
 static int znsShmUnmap(sqlite3_file *pFile, int deleteFlag)
 {
     zns_file *p = (zns_file *)pFile;
     return p->pReal->pMethods->xShmUnmap(p->pReal, deleteFlag);
 }
 
-/*
-** Fetch and unfetch methods - added in SQLite version 3.10.0
-*/
-static int znsFetch(
-    sqlite3_file *pFile,
-    sqlite3_int64 iOfst,
-    int iAmt,
-    void **pp)
+/* --- Fetch/Unfetch (Pass-through, related to Win32 specific VFS usually) --- */
+
+static int znsFetch(sqlite3_file *pFile, sqlite3_int64 iOfst, int iAmt, void **pp)
 {
     zns_file *p = (zns_file *)pFile;
-    /* Pass through to real implementation if it exists */
-    if (p->pReal->pMethods->xFetch)
+    if (p->pReal->pMethods->iVersion >= 3 && p->pReal->pMethods->xFetch)
     {
         return p->pReal->pMethods->xFetch(p->pReal, iOfst, iAmt, pp);
     }
-    else
-    {
-        *pp = 0;
-        return SQLITE_OK;
-    }
+    *pp = 0;
+    return SQLITE_OK; /* Or maybe SQLITE_IOERR? */
 }
-
-static int znsUnfetch(sqlite3_file *pFile, sqlite3_int64 iOfst, void *pPage)
+static int znsUnfetch(sqlite3_file *pFile, sqlite3_int64 iOfst, void *pData)
 {
     zns_file *p = (zns_file *)pFile;
-    /* Pass through to real implementation if it exists */
-    if (p->pReal->pMethods->xUnfetch)
+    if (p->pReal->pMethods->iVersion >= 3 && p->pReal->pMethods->xUnfetch)
     {
-        return p->pReal->pMethods->xUnfetch(p->pReal, iOfst, pPage);
+        return p->pReal->pMethods->xUnfetch(p->pReal, iOfst, pData);
     }
-    else
-    {
-        return SQLITE_OK;
-    }
+    return SQLITE_OK;
 }
+
+/* --- VFS Method Implementations --- */
 
 /*
 ** Open a file handle.
+** Handles redirection of WAL files to zone files if ZNS mode is enabled.
 */
 static int znsOpen(
     sqlite3_vfs *pVfs,
-    const char *zName,
-    sqlite3_file *pFile,
-    int flags,
-    int *pOutFlags)
+    const char *zOrigName, /* Original name passed by SQLite */
+    sqlite3_file *pFile,   /* The file handle structure to fill */
+    int flags,             /* Input flags */
+    int *pOutFlags         /* Output flags */
+)
 {
     zns_file *p = (zns_file *)pFile;
-    zns_vfs *pZnsVfs = (zns_vfs *)pVfs;
+    zns_vfs *pZnsVfs = (zns_vfs *)pVfs->pAppData; // Get our impl data
     int rc = SQLITE_OK;
-    char *zZnsPath = NULL;
-    char *zZoneFile = NULL;
+    const char *zNameToOpen = zOrigName;
+    char *zZoneFile = NULL; // Full path to assigned zone file
     int isWal = 0;
     int isZnsWal = 0;
+    int zoneIndex = -1;
 
-    /* Check if this is a WAL file */
-    if (zName && (flags & SQLITE_OPEN_WAL))
+    /* Ensure pOrigVfs is set */
+    if (!pOrigVfs)
+        pOrigVfs = pZnsVfs->pRealVfs;
+    if (!pOrigVfs)
+        return SQLITE_ERROR; // Should not happen if init was ok
+
+    /* Determine if this is potentially a WAL file to be handled by ZNS */
+    if (zOrigName && (flags & SQLITE_OPEN_WAL) && sqlite3WalUseZnsSsd())
     {
         isWal = 1;
+        // fprintf(stderr, "ZNS VFS DEBUG: Attempting to open potential WAL file: %s\n", zOrigName);
+        zZoneFile = znsGetFreeZoneFile(zOrigName); // Find or allocate a zone
 
-        /* 만약 ZNS 모드가 활성화된 경우 */
-        if (sqlite3WalUseZnsSsd())
+        if (zZoneFile)
         {
-            /* 기존 구현: zName 경로를 ZNS 경로로 변환 */
-            /* 그러나 zonefs에서는 임의 파일명 생성이 불가능하므로
-             * 사용 가능한 존 파일을 찾아야 함 */
-            zZoneFile = znsGetFreeZoneFile(zName);
-
-            if (zZoneFile)
-            {
-                /* 존 파일을 찾았다면 이 경로를 대신 사용 */
-                zName = zZoneFile;
-                isZnsWal = 1;
-            }
-            else
-            {
-                /* 사용 가능한 존 파일이 없으면 원래 경로 사용 */
-                return SQLITE_FULL;
-            }
-        }
-    }
-
-    /* Initialize the zns_file structure */
-    memset(p, 0, sizeof(zns_file));
-    p->pReal = (sqlite3_file *)&p[1]; /* Real file structure is stored right after */
-
-    /* Open the underlying file using the original VFS */
-    /* zonefs에서는 파일을 생성할 수 없고, O_CREAT 플래그를 제거해야 함 */
-    int modifiedFlags = flags;
-    if (isZnsWal)
-    {
-        modifiedFlags &= ~(SQLITE_OPEN_CREATE | SQLITE_OPEN_DELETEONCLOSE);
-    }
-
-    rc = pZnsVfs->pRealVfs->xOpen(pZnsVfs->pRealVfs, zName, p->pReal, modifiedFlags, pOutFlags);
-    if (rc != SQLITE_OK)
-    {
-        if (isZnsWal && zZoneFile)
-        {
-            /* 열기 실패 시 상태를 '미사용'으로 되돌림 */
+            // Found/allocated a zone file, use its path for opening
+            zNameToOpen = zZoneFile;
+            isZnsWal = 1;
+            // Find the index of the allocated zone for cleanup on error
             sqlite3_mutex_enter(zoneManager.mutex);
             for (int i = 0; i < zoneManager.nZones; i++)
             {
                 if (zoneManager.aZoneFiles[i] == zZoneFile)
-                {
-                    zoneManager.aZoneState[i] = 0; /* 미사용 상태로 변경 */
+                { // Pointer comparison is safe here
+                    zoneIndex = i;
                     break;
                 }
+            }
+            sqlite3_mutex_leave(zoneManager.mutex);
+            assert(zoneIndex != -1); // Should have found the index
+
+            fprintf(stderr, "ZNS VFS INFO: Mapping WAL %s to Zone %s (Index %d)\n", zOrigName, zNameToOpen, zoneIndex);
+        }
+        else
+        {
+            // No free zone available or zone manager init failed
+            fprintf(stderr, "ZNS VFS Error: No free zone available or manager uninitialized for WAL %s\n", zOrigName);
+            return SQLITE_FULL; // Indicate resource exhaustion
+        }
+    }
+
+    /* Initialize the zns_file structure */
+    memset(p, 0, sizeof(zns_file));                              // Zero out the whole struct first
+    p->pReal = (sqlite3_file *)(((char *)p) + sizeof(zns_file)); // Real struct follows ours
+    p->isWal = isWal;
+    p->isZnsWal = isZnsWal;
+    // Buffer fields (pBuffer, nBuffer, nAlloc, iFlushed) are zeroed by memset
+
+    /* Modify flags for zonefs: Cannot create, cannot delete on close */
+    int modifiedFlags = flags;
+    if (isZnsWal)
+    {
+        // Zone files must already exist (created by zonefs setup)
+        modifiedFlags &= ~(SQLITE_OPEN_CREATE | SQLITE_OPEN_DELETEONCLOSE);
+        // Ensure we open read-write if it's a ZNS WAL, regardless of input flags?
+        // SQLite usually opens WAL read-write anyway. Let's keep original RDWR flags.
+        // modifiedFlags |= SQLITE_OPEN_READWRITE;
+    }
+
+    /* Open the underlying file using the original VFS */
+    rc = pZnsVfs->pRealVfs->xOpen(pZnsVfs->pRealVfs, zNameToOpen, p->pReal, modifiedFlags, pOutFlags);
+
+    if (rc != SQLITE_OK)
+    {
+        fprintf(stderr, "ZNS VFS Error: Underlying xOpen failed for %s (rc=%d, name=%s, flags=0x%x)\n",
+                isZnsWal ? "zone file" : "file", rc, zNameToOpen, modifiedFlags);
+        if (isZnsWal && zZoneFile && zoneIndex != -1)
+        {
+            /* Open failed, release the allocated zone */
+            // fprintf(stderr, "ZNS VFS DEBUG: Releasing zone %d due to xOpen failure.\n", zoneIndex);
+            sqlite3_mutex_enter(zoneManager.mutex);
+            if (zoneManager.aZoneState[zoneIndex] == 1 && /* check if still allocated by us */
+                zoneManager.aWalNames[zoneIndex] != NULL) /* sanity check */
+            {
+                zoneManager.aZoneState[zoneIndex] = 0; /* Mark as Free */
+                sqlite3_free(zoneManager.aWalNames[zoneIndex]);
+                zoneManager.aWalNames[zoneIndex] = NULL;
             }
             sqlite3_mutex_leave(zoneManager.mutex);
         }
         return rc;
     }
 
-    /* Save the file information */
-    p->isWal = isWal;
-    p->isZnsWal = isZnsWal;
-    p->zPath = zZoneFile ? sqlite3_mprintf("%s", zZoneFile) : (zName ? sqlite3_mprintf("%s", zName) : NULL);
+    /* Store the actual path opened (could be original or zone file path) */
+    p->zPath = sqlite3_mprintf("%s", zNameToOpen);
+    if (!p->zPath)
+    {
+        p->pReal->pMethods->xClose(p->pReal); // Close the opened file
+        if (isZnsWal && zZoneFile && zoneIndex != -1)
+        {
+            // Release zone
+            sqlite3_mutex_enter(zoneManager.mutex);
+            if (zoneManager.aZoneState[zoneIndex] == 1 && zoneManager.aWalNames[zoneIndex] != NULL)
+            {
+                zoneManager.aZoneState[zoneIndex] = 0;
+                sqlite3_free(zoneManager.aWalNames[zoneIndex]);
+                zoneManager.aWalNames[zoneIndex] = NULL;
+            }
+            sqlite3_mutex_leave(zoneManager.mutex);
+        }
+        return SQLITE_NOMEM;
+    }
+
+    /* Get initial flushed size (important if reopening an existing zone file) */
+    if (p->isZnsWal)
+    {
+        rc = p->pReal->pMethods->xFileSize(p->pReal, &p->iFlushed);
+        if (rc != SQLITE_OK)
+        {
+            fprintf(stderr, "ZNS VFS Error: Failed to get initial file size for %s (rc=%d)\n", p->zPath, rc);
+            p->pReal->pMethods->xClose(p->pReal);
+            sqlite3_free(p->zPath);
+            // Release zone if allocated
+            if (isZnsWal && zZoneFile && zoneIndex != -1)
+            {
+                sqlite3_mutex_enter(zoneManager.mutex);
+                if (zoneManager.aZoneState[zoneIndex] == 1 && zoneManager.aWalNames[zoneIndex] != NULL)
+                {
+                    zoneManager.aZoneState[zoneIndex] = 0;
+                    sqlite3_free(zoneManager.aWalNames[zoneIndex]);
+                    zoneManager.aWalNames[zoneIndex] = NULL;
+                }
+                sqlite3_mutex_leave(zoneManager.mutex);
+            }
+            return rc;
+        }
+        p->nBuffer = p->iFlushed; // Initially, buffered size equals flushed size
+        // fprintf(stderr, "ZNS VFS DEBUG: Opened ZNS WAL %s. Initial flushed/buffered size: %lld\n", p->zPath, p->nBuffer);
+    }
 
     /* Set up the zns-file methods */
     p->base.pMethods = &zns_file_methods;
@@ -627,52 +851,119 @@ static int znsOpen(
 }
 
 /*
-** Delete the file located at zPath. If the dirSync parameter is true,
-** ensure the file-system modifications are synced to disk before
-** returning.
+** Delete the file located at zPath. For ZNS WAL files, this means resetting
+** the corresponding zone and marking it as free.
 */
 static int znsDelete(sqlite3_vfs *pVfs, const char *zPath, int dirSync)
 {
-    zns_vfs *pZnsVfs = (zns_vfs *)pVfs;
-    int isWal = 0;
-    char *zZnsPath = NULL;
-    int rc = SQLITE_OK;
+    zns_vfs *pZnsVfs = (zns_vfs *)pVfs->pAppData;
+    const char *zBaseName;
+    int i;
 
-    /* Check if this is a WAL file that might be on ZNS SSD */
-    if (zPath)
+    /* Check if it's a WAL file potentially handled by ZNS */
+    /* Use sqlite3_uri_boolean to check for "-wal" suffix robustly? No, simple check is fine. */
+    if (zPath && sqlite3WalUseZnsSsd())
     {
         int nPath = strlen(zPath);
         if (nPath > 4 && sqlite3_strnicmp(&zPath[nPath - 4], "-wal", 4) == 0)
         {
-            isWal = 1;
+            /* Extract the base WAL name (e.g., "database-wal") */
+            zBaseName = strrchr(zPath, '/');
+            zBaseName = zBaseName ? zBaseName + 1 : zPath;
 
-            /* If this is a WAL file and ZNS mode is enabled,
-            ** we might need to delete the file from ZNS path too */
-            if (sqlite3WalUseZnsSsd())
+            /* Check if the zone manager is initialized and seems valid */
+            if (zoneManager.zZnsPath && zoneManager.aZoneFiles && zoneManager.aWalNames && zoneManager.mutex)
             {
-                zZnsPath = getZnsWalPath(zPath);
+                sqlite3_mutex_enter(zoneManager.mutex);
+                int zoneFound = 0;
+                int zoneIndex = -1;
+                char *zZoneFilePath = NULL; // Store the path for reset
 
-                /* First try to delete from the ZNS location */
-                if (zZnsPath)
+                /* Find the zone mapped to this WAL name */
+                for (i = 0; i < zoneManager.nZones; i++)
                 {
-                    rc = pZnsVfs->pRealVfs->xDelete(pZnsVfs->pRealVfs, zZnsPath, dirSync);
-                    sqlite3_free(zZnsPath);
-
-                    /* If we successfully deleted the ZNS WAL file, we're done */
-                    if (rc == SQLITE_OK)
-                        return rc;
+                    if (zoneManager.aZoneState[i] == 1 && zoneManager.aWalNames[i] &&
+                        strcmp(zoneManager.aWalNames[i], zBaseName) == 0)
+                    {
+                        zoneIndex = i;
+                        zoneFound = 1;
+                        zZoneFilePath = zoneManager.aZoneFiles[i]; // Get the path *before* modifying state
+                        break;
+                    }
                 }
+
+                if (zoneFound && zZoneFilePath)
+                {
+                    fprintf(stderr, "ZNS VFS INFO: Deleting (Resetting) Zone %s for WAL %s\n",
+                            zZoneFilePath, zBaseName);
+
+                    /* Reset the zone. We need to open the zone file temporarily. */
+                    int fd = -1;
+                    int rc_reset = SQLITE_ERROR;
+                    struct stat st;
+                    struct blk_zone_range range = {0};
+
+                    fd = open(zZoneFilePath, O_RDWR);
+                    if (fd >= 0)
+                    {
+                        // No need for fstat, just set sector=0 for reset
+                        range.sector = 0;
+                        range.nr_sectors = 0; // Usually ignored
+                        if (ioctl(fd, BLKRESETZONE, &range) == 0)
+                        {
+                            rc_reset = SQLITE_OK;
+                            // fprintf(stderr, "ZNS VFS DEBUG: BLKRESETZONE successful for %s\n", zZoneFilePath);
+                        }
+                        else
+                        {
+                            fprintf(stderr, "ZNS VFS Error: BLKRESETZONE failed for %s: %s\n",
+                                    zZoneFilePath, strerror(errno));
+                            rc_reset = SQLITE_IOERR_DELETE; // Use specific delete error
+                        }
+                        close(fd);
+                    }
+                    else
+                    {
+                        fprintf(stderr, "ZNS VFS Error: Could not open zone file %s for reset: %s\n",
+                                zZoneFilePath, strerror(errno));
+                        rc_reset = SQLITE_IOERR_DELETE;
+                    }
+
+                    /* Update zone manager state regardless of reset success? Yes. */
+                    /* The mapping is gone, even if reset failed. */
+                    zoneManager.aZoneState[zoneIndex] = 0; /* Mark as Free */
+                    sqlite3_free(zoneManager.aWalNames[zoneIndex]);
+                    zoneManager.aWalNames[zoneIndex] = NULL;
+
+                    sqlite3_mutex_leave(zoneManager.mutex);
+                    /* Return OK if the conceptual delete (mapping removal) succeeded, */
+                    /* even if physical reset failed. */
+                    return SQLITE_OK;
+                    // Alternatively, return rc_reset if strict error propagation is needed:
+                    // return rc_reset;
+                }
+                else
+                {
+                    // fprintf(stderr, "ZNS VFS Warning: Delete called for WAL %s, but no allocated zone found.\n", zBaseName);
+                }
+
+                sqlite3_mutex_leave(zoneManager.mutex);
+            }
+            else
+            {
+                // fprintf(stderr, "ZNS VFS Warning: Delete called for potential WAL %s, but Zone Manager not ready.\n", zPath);
             }
         }
     }
 
-    /* Delete the file using the original VFS */
+    /* If not a ZNS WAL file or ZNS is disabled/uninitialized, pass through */
+    // fprintf(stderr, "ZNS VFS DEBUG: Passing delete for %s to underlying VFS.\n", zPath);
     return pZnsVfs->pRealVfs->xDelete(pZnsVfs->pRealVfs, zPath, dirSync);
 }
 
 /*
-** Test for access permissions. Return true if the requested permission
-** is available, or false otherwise.
+** Test for access permissions.
+** For ZNS WAL, check if a zone is allocated. Otherwise, passthrough.
 */
 static int znsAccess(
     sqlite3_vfs *pVfs,
@@ -680,241 +971,341 @@ static int znsAccess(
     int flags,
     int *pResOut)
 {
-    zns_vfs *pZnsVfs = (zns_vfs *)pVfs;
-    int isWal = 0;
-    char *zZnsPath = NULL;
+    zns_vfs *pZnsVfs = (zns_vfs *)pVfs->pAppData;
+    const char *zBaseName;
+    int i;
 
-    /* Check if this is a WAL file */
-    if (zPath)
+    /* Check if it's a WAL file potentially handled by ZNS */
+    if (zPath && sqlite3WalUseZnsSsd())
     {
         int nPath = strlen(zPath);
         if (nPath > 4 && sqlite3_strnicmp(&zPath[nPath - 4], "-wal", 4) == 0)
         {
-            isWal = 1;
+            zBaseName = strrchr(zPath, '/');
+            zBaseName = zBaseName ? zBaseName + 1 : zPath;
 
-            /* If this is a WAL file and ZNS mode is enabled, check the ZNS path */
-            if (sqlite3WalUseZnsSsd())
+            /* Check if the zone manager is initialized */
+            if (zoneManager.zZnsPath && zoneManager.aZoneFiles && zoneManager.aWalNames && zoneManager.mutex)
             {
-                zZnsPath = getZnsWalPath(zPath);
-
-                /* Check access permissions for the ZNS path */
-                if (zZnsPath)
+                int zoneFound = 0;
+                char *zZoneFilePath = NULL;
+                sqlite3_mutex_enter(zoneManager.mutex);
+                for (i = 0; i < zoneManager.nZones; i++)
                 {
-                    int rc = pZnsVfs->pRealVfs->xAccess(pZnsVfs->pRealVfs, zZnsPath, flags, pResOut);
-                    sqlite3_free(zZnsPath);
+                    if (zoneManager.aZoneState[i] == 1 && zoneManager.aWalNames[i] &&
+                        strcmp(zoneManager.aWalNames[i], zBaseName) == 0)
+                    {
+                        zoneFound = 1;
+                        zZoneFilePath = zoneManager.aZoneFiles[i]; // Get path for potential check
+                        break;
+                    }
+                }
+                sqlite3_mutex_leave(zoneManager.mutex);
 
-                    /* If the file exists in the ZNS path, we're done */
-                    if (rc == SQLITE_OK && *pResOut)
-                        return rc;
+                if (zoneFound && zZoneFilePath)
+                {
+                    /* Zone mapping exists. Check actual file access on the zone file */
+                    /* Pass the *zone file path* to the underlying access check */
+                    // fprintf(stderr, "ZNS VFS DEBUG: Access check for ZNS WAL %s -> zone %s\n", zPath, zZoneFilePath);
+                    return pZnsVfs->pRealVfs->xAccess(pZnsVfs->pRealVfs, zZoneFilePath, flags, pResOut);
+                }
+                else
+                {
+                    // No zone allocated for this name, so it doesn't exist in ZNS VFS terms
+                    // fprintf(stderr, "ZNS VFS DEBUG: Access check for ZNS WAL %s: No zone allocated.\n", zPath);
+                    *pResOut = 0; // Indicate not found
+                    return SQLITE_OK;
                 }
             }
+            // else { fprintf(stderr, "ZNS VFS DEBUG: Access check for potential WAL %s, Zone Manager not ready.\n", zPath); }
         }
     }
 
-    /* Fall back to the original VFS */
+    /* Fall back to the original VFS for non-ZNS files or if ZNS is disabled */
+    // fprintf(stderr, "ZNS VFS DEBUG: Passing access check for %s to underlying VFS.\n", zPath);
     return pZnsVfs->pRealVfs->xAccess(pZnsVfs->pRealVfs, zPath, flags, pResOut);
 }
 
 /*
-** Populate buffer zOut with the full canonical pathname corresponding
-** to the pathname in zPath. zOut is guaranteed to point to a buffer
-** of at least (SQLITE_MAX_PATHNAME+1) bytes.
+** Get the canonical path name
 */
 static int znsFullPathname(
     sqlite3_vfs *pVfs,
     const char *zPath,
-    int nOut,
-    char *zOut)
+    int nPathOut,
+    char *zPathOut)
 {
-    zns_vfs *pZnsVfs = (zns_vfs *)pVfs;
-    return pZnsVfs->pRealVfs->xFullPathname(pZnsVfs->pRealVfs, zPath, nOut, zOut);
+    zns_vfs *pZnsVfs = (zns_vfs *)pVfs->pAppData;
+    /* No redirection logic needed here, just pass through */
+    return pZnsVfs->pRealVfs->xFullPathname(pZnsVfs->pRealVfs, zPath, nPathOut, zPathOut);
 }
 
-/*
-** Open the dynamic library located at zPath and return a handle.
-*/
+/* --- Dynamic Loading stubs (Pass-through) --- */
 static void *znsDlOpen(sqlite3_vfs *pVfs, const char *zPath)
 {
-    zns_vfs *pZnsVfs = (zns_vfs *)pVfs;
+    zns_vfs *pZnsVfs = (zns_vfs *)pVfs->pAppData;
     return pZnsVfs->pRealVfs->xDlOpen(pZnsVfs->pRealVfs, zPath);
 }
-
-/*
-** Populate the buffer zErrMsg (size nByte bytes) with a human readable
-** utf-8 string describing the most recent error encountered associated
-** with dynamic libraries.
-*/
 static void znsDlError(sqlite3_vfs *pVfs, int nByte, char *zErrMsg)
 {
-    zns_vfs *pZnsVfs = (zns_vfs *)pVfs;
+    zns_vfs *pZnsVfs = (zns_vfs *)pVfs->pAppData;
     pZnsVfs->pRealVfs->xDlError(pZnsVfs->pRealVfs, nByte, zErrMsg);
 }
-
-/*
-** Return a pointer to the symbol zSymbol in the dynamic library pHandle.
-*/
-static void (*znsDlSym(sqlite3_vfs *pVfs, void *p, const char *zSym))(void)
+static void (*znsDlSym(sqlite3_vfs *pVfs, void *pHandle, const char *zSymbol))(void)
 {
-    zns_vfs *pZnsVfs = (zns_vfs *)pVfs;
-    return pZnsVfs->pRealVfs->xDlSym(pZnsVfs->pRealVfs, p, zSym);
+    zns_vfs *pZnsVfs = (zns_vfs *)pVfs->pAppData;
+    return pZnsVfs->pRealVfs->xDlSym(pZnsVfs->pRealVfs, pHandle, zSymbol);
 }
-
-/*
-** Close the dynamic library handle pHandle.
-*/
 static void znsDlClose(sqlite3_vfs *pVfs, void *pHandle)
 {
-    zns_vfs *pZnsVfs = (zns_vfs *)pVfs;
+    zns_vfs *pZnsVfs = (zns_vfs *)pVfs->pAppData;
     pZnsVfs->pRealVfs->xDlClose(pZnsVfs->pRealVfs, pHandle);
 }
 
-/*
-** Populate the buffer pointed to by zBufOut with nByte bytes of
-** random data.
-*/
+/* --- Randomness, Sleep, Time (Pass-through) --- */
 static int znsRandomness(sqlite3_vfs *pVfs, int nByte, char *zBufOut)
 {
-    zns_vfs *pZnsVfs = (zns_vfs *)pVfs;
+    zns_vfs *pZnsVfs = (zns_vfs *)pVfs->pAppData;
     return pZnsVfs->pRealVfs->xRandomness(pZnsVfs->pRealVfs, nByte, zBufOut);
 }
-
-/*
-** Sleep for nMicro microseconds. Return the number of microseconds
-** actually slept.
-*/
-static int znsSleep(sqlite3_vfs *pVfs, int nMicro)
+static int znsSleep(sqlite3_vfs *pVfs, int microsec)
 {
-    zns_vfs *pZnsVfs = (zns_vfs *)pVfs;
-    return pZnsVfs->pRealVfs->xSleep(pZnsVfs->pRealVfs, nMicro);
+    zns_vfs *pZnsVfs = (zns_vfs *)pVfs->pAppData;
+    return pZnsVfs->pRealVfs->xSleep(pZnsVfs->pRealVfs, microsec);
 }
-
-/*
-** Return the current time as a Julian Day number in *pTimeOut.
-*/
 static int znsCurrentTime(sqlite3_vfs *pVfs, double *pTimeOut)
 {
-    zns_vfs *pZnsVfs = (zns_vfs *)pVfs;
+    zns_vfs *pZnsVfs = (zns_vfs *)pVfs->pAppData;
     return pZnsVfs->pRealVfs->xCurrentTime(pZnsVfs->pRealVfs, pTimeOut);
 }
-
-/*
-** Return the current time as a Julian Day number in *pTimeOut.
-** This version includes the fractional microseconds.
-*/
 static int znsCurrentTimeInt64(sqlite3_vfs *pVfs, sqlite3_int64 *pTimeOut)
 {
-    zns_vfs *pZnsVfs = (zns_vfs *)pVfs;
-    if (pZnsVfs->pRealVfs->xCurrentTimeInt64)
+    zns_vfs *pZnsVfs = (zns_vfs *)pVfs->pAppData;
+    /* Check if the underlying VFS supports CurrentTimeInt64 */
+    if (pZnsVfs->pRealVfs->iVersion >= 2 && pZnsVfs->pRealVfs->xCurrentTimeInt64)
     {
         return pZnsVfs->pRealVfs->xCurrentTimeInt64(pZnsVfs->pRealVfs, pTimeOut);
     }
     else
     {
-        double d;
-        int rc = pZnsVfs->pRealVfs->xCurrentTime(pZnsVfs->pRealVfs, &d);
-        if (rc == SQLITE_OK)
-        {
-            *pTimeOut = (sqlite3_int64)(d * 86400000.0);
-        }
+        /* Fallback using xCurrentTime if Int64 version not available */
+        double r;
+        int rc = pZnsVfs->pRealVfs->xCurrentTime(pZnsVfs->pRealVfs, &r);
+        *pTimeOut = (sqlite3_int64)(r * 86400000.0);
         return rc;
     }
 }
-
-/*
-** Return the last error code and message for this VFS
-*/
-static int znsGetLastError(sqlite3_vfs *pVfs, int nBuf, char *zBuf)
+static int znsGetLastError(sqlite3_vfs *pVfs, int iErrno, char *zErrstr)
 {
-    zns_vfs *pZnsVfs = (zns_vfs *)pVfs;
-    if (pZnsVfs->pRealVfs->xGetLastError)
+    zns_vfs *pZnsVfs = (zns_vfs *)pVfs->pAppData;
+    /* Check version before calling */
+    if (pZnsVfs->pRealVfs->iVersion >= 1 && pZnsVfs->pRealVfs->xGetLastError)
     {
-        return pZnsVfs->pRealVfs->xGetLastError(pZnsVfs->pRealVfs, nBuf, zBuf);
+        return pZnsVfs->pRealVfs->xGetLastError(pZnsVfs->pRealVfs, iErrno, zErrstr);
     }
-    return 0;
+    /* Provide a generic message if the underlying VFS doesn't support it */
+    if (zErrstr)
+    {
+        sqlite3_snprintf(SQLITE_MSG_SIZE, zErrstr, "System call error number %d", iErrno);
+    }
+    return iErrno;
 }
+
+/* --- Zone Manager Functions --- */
 
 /*
 ** Zone 관리자 초기화 함수
 */
 static int znsZoneManagerInit(const char *zZnsPath)
 {
-    DIR *dir;
+    DIR *dir = NULL;
     struct dirent *entry;
     int nZones = 0;
-    char **aFiles = NULL;
     int i = 0;
+    int rc = SQLITE_OK;
+    char **aZoneFilesTemp = NULL; // Temporary arrays for allocation
+    int *aZoneStateTemp = NULL;
+    char **aWalNamesTemp = NULL;
 
     if (!zZnsPath || !zZnsPath[0])
         return SQLITE_ERROR;
 
-    /* 이미 초기화된 경우 */
+    /* Already initialized and path matches? */
+    sqlite3_mutex_enter(zoneManager.mutex); // Need mutex early for thread safety
     if (zoneManager.zZnsPath)
-        return SQLITE_OK;
+    {
+        if (strcmp(zoneManager.zZnsPath, zZnsPath) == 0)
+        {
+            sqlite3_mutex_leave(zoneManager.mutex);
+            return SQLITE_OK; // Already initialized with same path
+        }
+        else
+        {
+            // Path changed - need to destroy old and re-initialize
+            fprintf(stderr, "ZNS VFS INFO: ZNS path changed. Re-initializing Zone Manager.\n");
+            sqlite3_mutex_leave(zoneManager.mutex); // Leave before calling destroy
+            znsZoneManagerDestroy();
+            sqlite3_mutex_enter(zoneManager.mutex); // Re-acquire for init
+        }
+    }
+    sqlite3_mutex_leave(zoneManager.mutex); // Leave before potentially long opendir/readdir
 
-    /* ZNS 경로 열기 */
+    fprintf(stderr, "ZNS VFS INFO: Initializing Zone Manager for path: %s\n", zZnsPath);
+
+    /* Open ZNS path directory */
     dir = opendir(zZnsPath);
     if (!dir)
-        return SQLITE_ERROR;
+    {
+        fprintf(stderr, "ZNS VFS Error: Cannot open directory %s: %s\n", zZnsPath, strerror(errno));
+        return SQLITE_CANTOPEN;
+    }
 
-    /* 존 파일 개수 세기 (zonefs의 형식은 일반적으로 0000, 0001, ... 의 형식) */
+    /* Count potential zone files matching the pattern */
     while ((entry = readdir(dir)) != NULL)
     {
-        if (entry->d_type == DT_REG)
+        if (entry->d_type == DT_REG || entry->d_type == DT_UNKNOWN) // Check UNKNOWN too (some fs)
         {
-            unsigned int zoneNum;
-            /* 16진수 형식으로 된 파일 이름인지 확인 (예: "0000") */
+            unsigned int zoneNum; // Use unsigned for sscanf
             if (sscanf(entry->d_name, ZONEFS_SEQ_FILE_PATTERN, &zoneNum) == 1)
             {
                 nZones++;
             }
         }
     }
-    rewinddir(dir);
-
-    /* 메모리 할당 */
-    zoneManager.zZnsPath = sqlite3_mprintf("%s", zZnsPath);
-    zoneManager.nZones = nZones;
-    zoneManager.aZoneState = sqlite3_malloc(sizeof(int) * nZones);
-    zoneManager.aZoneFiles = sqlite3_malloc(sizeof(char *) * nZones);
-    zoneManager.mutex = sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
-
-    if (!zoneManager.zZnsPath || !zoneManager.aZoneState ||
-        !zoneManager.aZoneFiles || !zoneManager.mutex)
+    fprintf(stderr, "ZNS VFS INFO: Found %d potential zone files matching pattern '%s'.\n", nZones, ZONEFS_SEQ_FILE_PATTERN);
+    if (nZones == 0)
     {
-        /* 메모리 할당 실패 시 정리 */
-        sqlite3_free(zoneManager.zZnsPath);
-        sqlite3_free(zoneManager.aZoneState);
-        sqlite3_free(zoneManager.aZoneFiles);
-        if (zoneManager.mutex)
-            sqlite3_mutex_free(zoneManager.mutex);
-
-        memset(&zoneManager, 0, sizeof(zoneManager));
-        closedir(dir);
-        return SQLITE_NOMEM;
+        fprintf(stderr, "ZNS VFS Warning: No zone files found in %s.\n", zZnsPath);
+        // Proceed with 0 zones, manager will be mostly inactive
     }
 
-    /* 초기값 설정 */
-    memset(zoneManager.aZoneState, 0, sizeof(int) * nZones);
-    memset(zoneManager.aZoneFiles, 0, sizeof(char *) * nZones);
+    rewinddir(dir); // Reset directory stream to read names again
 
-    /* 존 파일들의 경로를 저장 */
+    /* Allocate memory (use temporary pointers first) */
+    /* Note: Using sqlite3_*alloc ensures SQLite knows about this memory if tracking */
+    aZoneStateTemp = sqlite3_malloc(sizeof(int) * nZones);
+    aZoneFilesTemp = sqlite3_malloc(sizeof(char *) * nZones);
+    aWalNamesTemp = sqlite3_malloc(sizeof(char *) * nZones);
+
+    if (nZones > 0 && (!aZoneStateTemp || !aZoneFilesTemp || !aWalNamesTemp))
+    {
+        fprintf(stderr, "ZNS VFS Error: Failed to allocate memory for Zone Manager arrays (nZones=%d).\n", nZones);
+        rc = SQLITE_NOMEM;
+        goto init_error_cleanup;
+    }
+
+    /* Zero out the pointer arrays */
+    if (nZones > 0)
+    {
+        memset(aZoneStateTemp, 0, sizeof(int) * nZones); // Initialize state to Free
+        memset(aZoneFilesTemp, 0, sizeof(char *) * nZones);
+        memset(aWalNamesTemp, 0, sizeof(char *) * nZones);
+    }
+
+    /* Store zone file paths */
     i = 0;
     while ((entry = readdir(dir)) != NULL && i < nZones)
     {
-        if (entry->d_type == DT_REG)
+        if (entry->d_type == DT_REG || entry->d_type == DT_UNKNOWN)
         {
             unsigned int zoneNum;
             if (sscanf(entry->d_name, ZONEFS_SEQ_FILE_PATTERN, &zoneNum) == 1)
             {
-                zoneManager.aZoneFiles[i] = sqlite3_mprintf(
-                    "%s/%s", zZnsPath, entry->d_name);
+                // Allocate full path string
+                aZoneFilesTemp[i] = sqlite3_mprintf("%s/%s", zZnsPath, entry->d_name);
+                if (!aZoneFilesTemp[i])
+                {
+                    fprintf(stderr, "ZNS VFS Error: Failed to allocate memory for zone file path %s/%s.\n", zZnsPath, entry->d_name);
+                    rc = SQLITE_NOMEM;
+                    // Need to free already allocated path strings before bailing out
+                    for (int j = 0; j < i; j++)
+                    {
+                        sqlite3_free(aZoneFilesTemp[j]);
+                    }
+                    goto init_error_cleanup;
+                }
                 i++;
             }
         }
     }
-    closedir(dir);
+    closedir(dir); // Close directory stream now
+    dir = NULL;    // Mark as closed
 
+    /* Now, acquire mutex and update the global structure */
+    sqlite3_mutex_enter(zoneManager.mutex);
+    if (zoneManager.zZnsPath)
+    { // Check if another thread initialized in the meantime
+        sqlite3_mutex_leave(zoneManager.mutex);
+        fprintf(stderr, "ZNS VFS Warning: Zone Manager initialized by another thread concurrently.\n");
+        // Free temporary allocations
+        sqlite3_free(aZoneStateTemp);
+        if (aZoneFilesTemp)
+        {
+            for (int k = 0; k < i; k++)
+                sqlite3_free(aZoneFilesTemp[k]); // Free paths allocated in this attempt
+            sqlite3_free(aZoneFilesTemp);
+        }
+        sqlite3_free(aWalNamesTemp);
+        return SQLITE_OK; // Assume the other thread succeeded
+    }
+
+    /* Assign allocated resources to the global manager */
+    zoneManager.zZnsPath = sqlite3_mprintf("%s", zZnsPath); // Duplicate path string
+    if (!zoneManager.zZnsPath)
+    {
+        rc = SQLITE_NOMEM; // Failed to copy path string
+    }
+    else
+    {
+        zoneManager.nZones = nZones;
+        zoneManager.aZoneState = aZoneStateTemp;
+        zoneManager.aZoneFiles = aZoneFilesTemp;
+        zoneManager.aWalNames = aWalNamesTemp;
+        // Ensure mutex is allocated if not already (should be done first ideally)
+        if (!zoneManager.mutex)
+        {
+            zoneManager.mutex = sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
+            if (!zoneManager.mutex)
+                rc = SQLITE_NOMEM;
+        }
+    }
+
+    if (rc != SQLITE_OK)
+    {
+        // Cleanup if assignment failed
+        sqlite3_free(zoneManager.zZnsPath);
+        zoneManager.zZnsPath = NULL;
+        sqlite3_free(aZoneStateTemp); // Free temps as they weren't assigned
+        if (aZoneFilesTemp)
+        {
+            for (int k = 0; k < i; k++)
+                sqlite3_free(aZoneFilesTemp[k]);
+            sqlite3_free(aZoneFilesTemp);
+        }
+        sqlite3_free(aWalNamesTemp);
+        if (zoneManager.mutex)
+        {
+            sqlite3_mutex_free(zoneManager.mutex);
+            zoneManager.mutex = NULL;
+        }
+        memset(&zoneManager, 0, sizeof(zoneManager)); // Clear manager struct
+        sqlite3_mutex_leave(zoneManager.mutex);
+        fprintf(stderr, "ZNS VFS Error: Failed during final assignment in Zone Manager Init (rc=%d).\n", rc);
+        return rc;
+    }
+
+    sqlite3_mutex_leave(zoneManager.mutex);
+    fprintf(stderr, "ZNS VFS INFO: Zone Manager Initialized successfully with %d zones for %s.\n", zoneManager.nZones, zoneManager.zZnsPath);
     return SQLITE_OK;
+
+init_error_cleanup:
+    if (dir)
+        closedir(dir);
+    // Free temporary arrays if allocation failed partway
+    sqlite3_free(aZoneStateTemp);
+    sqlite3_free(aZoneFilesTemp); // Note: contained paths are not allocated if this failed early
+    sqlite3_free(aWalNamesTemp);
+    return rc;
 }
 
 /*
@@ -924,186 +1315,364 @@ static void znsZoneManagerDestroy(void)
 {
     int i;
 
-    if (!zoneManager.zZnsPath)
-        return;
+    if (!zoneManager.mutex)
+        return; // Not initialized or already destroyed
 
     sqlite3_mutex_enter(zoneManager.mutex);
 
-    sqlite3_free(zoneManager.zZnsPath);
-    sqlite3_free(zoneManager.aZoneState);
-
-    for (i = 0; i < zoneManager.nZones; i++)
-    {
-        sqlite3_free(zoneManager.aZoneFiles[i]);
+    if (!zoneManager.zZnsPath)
+    { // Check again inside mutex
+        sqlite3_mutex_leave(zoneManager.mutex);
+        return;
     }
-    sqlite3_free(zoneManager.aZoneFiles);
 
-    sqlite3_mutex_leave(zoneManager.mutex);
-    sqlite3_mutex_free(zoneManager.mutex);
+    fprintf(stderr, "ZNS VFS INFO: Destroying Zone Manager for path: %s\n", zoneManager.zZnsPath);
 
-    memset(&zoneManager, 0, sizeof(zoneManager));
+    sqlite3_free(zoneManager.zZnsPath);
+    zoneManager.zZnsPath = NULL;
+    sqlite3_free(zoneManager.aZoneState);
+    zoneManager.aZoneState = NULL;
+
+    if (zoneManager.aZoneFiles)
+    {
+        for (i = 0; i < zoneManager.nZones; i++)
+        {
+            sqlite3_free(zoneManager.aZoneFiles[i]); // Free individual path strings
+        }
+        sqlite3_free(zoneManager.aZoneFiles); // Free the array of pointers
+        zoneManager.aZoneFiles = NULL;
+    }
+
+    if (zoneManager.aWalNames)
+    {
+        for (i = 0; i < zoneManager.nZones; i++)
+        {
+            sqlite3_free(zoneManager.aWalNames[i]); // Free individual WAL name strings
+        }
+        sqlite3_free(zoneManager.aWalNames); // Free the array of pointers
+        zoneManager.aWalNames = NULL;
+    }
+
+    zoneManager.nZones = 0;
+    sqlite3_mutex *pMutexToFree = zoneManager.mutex; // Hold mutex pointer
+    zoneManager.mutex = NULL;                        // Mark as destroyed inside lock
+
+    sqlite3_mutex_leave(pMutexToFree); // Leave mutex BEFORE freeing it
+    sqlite3_mutex_free(pMutexToFree);  // Free the mutex itself
+
+    fprintf(stderr, "ZNS VFS INFO: Zone Manager Destroyed.\n");
 }
 
 /*
-** 사용 가능한 zone 파일 찾기
+** 사용 가능한 zone 파일 찾고 할당하기
+** zWalName: SQLite가 전달한 원본 WAL 파일 경로 (e.g., /path/to/db-wal)
+** Returns: Full path to the allocated zone file (e.g., /zonefs/mount/0001)
+**          or NULL if none available or error.
 */
 static char *znsGetFreeZoneFile(const char *zWalName)
 {
     int i;
     char *zZoneFile = NULL;
+    const char *zBaseName; // WAL 파일의 기본 이름 (e.g., "db-wal")
 
-    if (!zoneManager.zZnsPath || !zoneManager.aZoneFiles)
+    /* Ensure manager is initialized for the current path */
+    const char *currentZnsPath = sqlite3WalGetZnsSsdPath();
+    if (!currentZnsPath || znsZoneManagerInit(currentZnsPath) != SQLITE_OK)
     {
-        znsZoneManagerInit(sqlite3WalGetZnsSsdPath());
+        fprintf(stderr, "ZNS VFS Error: Zone Manager not initialized or init failed in znsGetFreeZoneFile.\n");
+        return NULL;
     }
-
-    if (!zoneManager.zZnsPath || !zoneManager.aZoneFiles)
+    // Re-check after init attempt (might have failed)
+    if (!zoneManager.mutex || !zoneManager.zZnsPath || !zoneManager.aZoneFiles)
     {
+        fprintf(stderr, "ZNS VFS Error: Zone Manager unavailable after init attempt.\n");
         return NULL;
     }
 
+    /* Extract base WAL name (the part after the last '/') */
+    zBaseName = strrchr(zWalName, '/');
+    zBaseName = zBaseName ? zBaseName + 1 : zWalName;
+
     sqlite3_mutex_enter(zoneManager.mutex);
 
-    /* 이미 이 WAL 파일용으로 할당된 Zone이 있는지 확인 */
+    /* 1. Check if a zone is already allocated for this specific WAL base name */
     for (i = 0; i < zoneManager.nZones; i++)
     {
-        if (zoneManager.aZoneState[i] == 2)
+        if (zoneManager.aZoneState[i] == 1 && zoneManager.aWalNames[i] &&
+            strcmp(zoneManager.aWalNames[i], zBaseName) == 0)
         {
-            /* WAL 파일 이름이 마지막 경로 성분만 비교 */
-            const char *zBaseName = strrchr(zWalName, '/');
-            zBaseName = zBaseName ? zBaseName + 1 : zWalName;
-
-            const char *zZoneBaseName = strrchr(zoneManager.aZoneFiles[i], '/');
-            zZoneBaseName = zZoneBaseName ? zZoneBaseName + 1 : zoneManager.aZoneFiles[i];
-
-            /* 이미 사용 중인 zone 파일 반환 */
-            if (strcmp(zBaseName, zZoneBaseName) == 0)
-            {
-                zZoneFile = zoneManager.aZoneFiles[i];
-                break;
-            }
+            zZoneFile = zoneManager.aZoneFiles[i]; // Found existing mapping
+            // fprintf(stderr, "ZNS VFS DEBUG: Found existing mapping for WAL %s to Zone %s\n", zBaseName, zZoneFile);
+            break;
         }
     }
 
-    /* 사용 가능한 Zone 찾기 */
+    /* 2. If not found, find the first available free zone */
     if (!zZoneFile)
     {
         for (i = 0; i < zoneManager.nZones; i++)
         {
-            if (zoneManager.aZoneState[i] == 0)
+            if (zoneManager.aZoneState[i] == 0) /* Look for a Free zone */
             {
-                zoneManager.aZoneState[i] = 1; /* 사용 중 표시 */
-                zZoneFile = zoneManager.aZoneFiles[i];
-                break;
+                // Attempt to allocate this zone
+                zoneManager.aWalNames[i] = sqlite3_mprintf("%s", zBaseName); // Store WAL base name
+                if (!zoneManager.aWalNames[i])
+                {
+                    fprintf(stderr, "ZNS VFS Error: Failed to allocate memory for WAL name mapping (%s).\n", zBaseName);
+                    // Leave zone state as 0, break and return NULL below
+                    break;
+                }
+                zoneManager.aZoneState[i] = 1;         /* Mark as Allocated */
+                zZoneFile = zoneManager.aZoneFiles[i]; // Assign the zone file path
+                // fprintf(stderr, "ZNS VFS DEBUG: Allocated new Zone %s (Index %d) for WAL %s\n", zZoneFile, i, zBaseName);
+                break; /* Exit loop after finding and allocating a free zone */
             }
+        }
+        if (!zZoneFile && i == zoneManager.nZones) // Check if loop finished without finding free zone
+        {
+            fprintf(stderr, "ZNS VFS Warning: No free zone found for WAL %s (Checked %d zones).\n", zBaseName, zoneManager.nZones);
+            // Fall through to return NULL
+        }
+        else if (!zZoneFile && zoneManager.aWalNames[i] == NULL)
+        {
+            // Name allocation failed inside loop
+            // Zone state is still 0
+            fprintf(stderr, "ZNS VFS Error: Allocation failed, could not assign zone for WAL %s.\n", zBaseName);
         }
     }
 
     sqlite3_mutex_leave(zoneManager.mutex);
-    return zZoneFile;
+    return zZoneFile; /* Returns pointer to path string in zoneManager.aZoneFiles or NULL */
 }
 
+/* --- VFS Initialization and Registration --- */
+
 /*
-** Initialize the ZNS VFS module.
-** This routine registers the ZNS VFS with SQLite.
+** Initialize the ZNS VFS structure.
 */
-static int znsVfsInit(sqlite3_vfs *pOrigVfs)
+static int znsVfsInit(sqlite3_vfs *pDefaultVfs)
 {
-    static sqlite3_vfs zns_vfs;
+    /* The VFS structure registered with SQLite */
+    static sqlite3_vfs zns_vfs_struct;
+    /* Contains the pointer to the real VFS */
     static zns_vfs zns_vfs_impl;
 
-    /* Store the original VFS pointer */
-    if (pOrigVfs == 0)
-    {
-        /* If no VFS specified, use the default unix VFS */
-        pOrigVfs = sqlite3_vfs_find("unix");
-        if (pOrigVfs == 0)
-            return SQLITE_ERROR;
-    }
-
-    /* Initialize the wrapper VFS */
-    memset(&zns_vfs_impl, 0, sizeof(zns_vfs_impl));
-    zns_vfs_impl.pRealVfs = pOrigVfs;
-
-    /* Initialize the public VFS structure */
-    memset(&zns_vfs, 0, sizeof(sqlite3_vfs));
-    zns_vfs.iVersion = 3;                                     /* Structure version number */
-    zns_vfs.szOsFile = sizeof(zns_file) + pOrigVfs->szOsFile; /* Size of subclassed sqlite3_file */
-    zns_vfs.mxPathname = pOrigVfs->mxPathname;                /* Maximum path length */
-    zns_vfs.pNext = 0;                                        /* Next registered VFS */
-    zns_vfs.zName = "zns";                                    /* Name of this VFS */
-    zns_vfs.pAppData = &zns_vfs_impl;                         /* Pointer to ZNS VFS */
-
-    /* IO methods */
-    zns_vfs.xOpen = znsOpen;
-    zns_vfs.xDelete = znsDelete;
-    zns_vfs.xAccess = znsAccess;
-    zns_vfs.xFullPathname = znsFullPathname;
-    zns_vfs.xDlOpen = znsDlOpen;
-    zns_vfs.xDlError = znsDlError;
-    zns_vfs.xDlSym = znsDlSym;
-    zns_vfs.xDlClose = znsDlClose;
-    zns_vfs.xRandomness = znsRandomness;
-    zns_vfs.xSleep = znsSleep;
-    zns_vfs.xCurrentTime = znsCurrentTime;
-    zns_vfs.xGetLastError = znsGetLastError;
-    zns_vfs.xCurrentTimeInt64 = znsCurrentTimeInt64;
-
-    /* Register the ZNS VFS */
-    return sqlite3_vfs_register(&zns_vfs, 0);
-}
-
-/*
-** External API function to initialize the ZNS VFS extension
-*/
-int sqlite3_zns_init(
-    sqlite3 *db,
-    char **pzErrMsg,
-    const sqlite3_api_routines *pApi)
-{
-    int rc = SQLITE_OK;
-    SQLITE_EXTENSION_INIT2(pApi);
-
-    /* Save the original VFS */
-    if (pOrigVfs == 0)
-    {
-        pOrigVfs = sqlite3_vfs_find("unix");
-        if (pOrigVfs == 0)
-            return SQLITE_ERROR;
-    }
-
-    /* Initialize the ZNS VFS */
-    rc = znsVfsInit(pOrigVfs);
-
-    /* Set this VFS as the default if requested */
-    /* sqlite3_vfs_register(sqlite3_vfs_find("zns"), 1); */
-
-    return rc;
-}
-
-/* Export public API functions to set ZNS path and enable ZNS mode */
-int sqlite3_wal_use_zns(const char *znsPath)
-{
-    extern void sqlite3WalSetZnsSsdPath(const char *zPath);
-    extern void sqlite3WalEnableZnsSsd(int enable);
-
-    if (znsPath == 0 || znsPath[0] == 0)
-    {
-        sqlite3WalEnableZnsSsd(0);
-        sqlite3WalSetZnsSsdPath(0);
-        return SQLITE_OK;
-    }
-
-    /* Check if the path is valid */
-    struct stat st;
-    if (stat(znsPath, &st) != 0 || !S_ISDIR(st.st_mode))
+    /* Make sure the default VFS is valid */
+    if (pDefaultVfs == NULL)
     {
         return SQLITE_ERROR;
     }
 
-    /* Set the path and enable ZNS mode */
+    /* Store the original VFS pointer if not already done */
+    if (pOrigVfs == 0)
+    {
+        pOrigVfs = pDefaultVfs;
+    }
+
+    /* Initialize the wrapper VFS implementation data */
+    // memset(&zns_vfs_impl, 0, sizeof(zns_vfs_impl)); // Only needs pRealVfs
+    zns_vfs_impl.pRealVfs = pOrigVfs;
+
+    /* Initialize the public VFS structure */
+    memset(&zns_vfs_struct, 0, sizeof(sqlite3_vfs));
+    zns_vfs_struct.iVersion = 3; /* VFS API version */
+    /* Our file handle contains zns_file + space for the original VFS file handle */
+    zns_vfs_struct.szOsFile = sizeof(zns_file) + pOrigVfs->szOsFile - sizeof(sqlite3_file);
+    zns_vfs_struct.mxPathname = pOrigVfs->mxPathname;
+    zns_vfs_struct.pNext = 0;
+    zns_vfs_struct.zName = "zns";            /* Name of this VFS */
+    zns_vfs_struct.pAppData = &zns_vfs_impl; /* Link to our implementation details */
+
+    /* VFS methods */
+    zns_vfs_struct.xOpen = znsOpen;
+    zns_vfs_struct.xDelete = znsDelete;
+    zns_vfs_struct.xAccess = znsAccess;
+    zns_vfs_struct.xFullPathname = znsFullPathname;
+    zns_vfs_struct.xDlOpen = znsDlOpen;
+    zns_vfs_struct.xDlError = znsDlError;
+    zns_vfs_struct.xDlSym = znsDlSym;
+    zns_vfs_struct.xDlClose = znsDlClose;
+    zns_vfs_struct.xRandomness = znsRandomness;
+    zns_vfs_struct.xSleep = znsSleep;
+    zns_vfs_struct.xCurrentTime = znsCurrentTime;
+    zns_vfs_struct.xGetLastError = znsGetLastError;
+    zns_vfs_struct.xCurrentTimeInt64 = znsCurrentTimeInt64;
+    /* Optional system call methods if needed */
+    // zns_vfs_struct.xSetSystemCall = znsSetSystemCall;
+    // zns_vfs_struct.xGetSystemCall = znsGetSystemCall;
+    // zns_vfs_struct.xNextSystemCall = znsNextSystemCall;
+
+    /* Register the ZNS VFS. Make it NOT the default initially. */
+    fprintf(stderr, "ZNS VFS INFO: Registering VFS 'zns'.\n");
+    int rc = sqlite3_vfs_register(&zns_vfs_struct, 0);
+    if (rc != SQLITE_OK)
+    {
+        fprintf(stderr, "ZNS VFS Error: Failed to register VFS 'zns' (rc=%d).\n", rc);
+    }
+    return rc;
+}
+
+/*
+** Entry point for the ZNS VFS extension.
+*/
+#ifdef _WIN32
+__declspec(dllexport)
+#endif
+int
+sqlite3_zns_init(
+    sqlite3 *db,                     /* Unused */
+    char **pzErrMsg,                 /* Error message out */
+    const sqlite3_api_routines *pApi /* API routines */
+)
+{
+    int rc = SQLITE_OK;
+    sqlite3_vfs *pDefaultVfs;
+    SQLITE_EXTENSION_INIT2(pApi);
+    (void)db; // Mark db as unused
+
+    fprintf(stderr, "ZNS VFS Extension: sqlite3_zns_init called.\n");
+
+    /* Ensure the Zone Manager mutex is created early */
+    if (!zoneManager.mutex)
+    {
+        zoneManager.mutex = sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
+        if (!zoneManager.mutex)
+        {
+            fprintf(stderr, "ZNS VFS Error: Failed to allocate Zone Manager mutex.\n");
+            if (pzErrMsg)
+                *pzErrMsg = sqlite3_mprintf("Failed to allocate mutex");
+            return SQLITE_NOMEM;
+        }
+    }
+
+    /* Find the default VFS to wrap */
+    pDefaultVfs = sqlite3_vfs_find(0);
+    if (pDefaultVfs == 0)
+    {
+        fprintf(stderr, "ZNS VFS Error: Cannot find default VFS during init.\n");
+        if (pzErrMsg)
+            *pzErrMsg = sqlite3_mprintf("Cannot find default VFS");
+        rc = SQLITE_ERROR;
+        goto init_failed;
+    }
+    /* Avoid re-registering if already registered */
+    if (sqlite3_vfs_find("zns"))
+    {
+        fprintf(stderr, "ZNS VFS INFO: VFS 'zns' already registered.\n");
+        /* Should we still try to init the zone manager? Yes, if path changed. */
+    }
+    else
+    {
+        /* Initialize and register the ZNS VFS structure */
+        rc = znsVfsInit(pDefaultVfs);
+        if (rc != SQLITE_OK)
+        {
+            fprintf(stderr, "ZNS VFS Error: Failed to initialize or register VFS (rc=%d).\n", rc);
+            if (pzErrMsg)
+                *pzErrMsg = sqlite3_mprintf("Failed to initialize ZNS VFS (rc=%d)", rc);
+            goto init_failed;
+        }
+    }
+
+    /* Initialize the Zone Manager if ZNS path is already set globally */
+    /* This requires the external sqlite3WalGetZnsSsdPath/UseZnsSsd functions */
+    const char *currentZnsPath = sqlite3WalGetZnsSsdPath();
+    if (sqlite3WalUseZnsSsd() && currentZnsPath)
+    {
+        rc = znsZoneManagerInit(currentZnsPath);
+        if (rc != SQLITE_OK)
+        {
+            fprintf(stderr, "ZNS VFS Error: Failed to initialize Zone Manager during extension init (rc=%d).\n", rc);
+            if (pzErrMsg)
+                *pzErrMsg = sqlite3_mprintf("Failed to initialize Zone Manager (rc=%d)", rc);
+            /* Should we unregister the VFS here? Maybe not, allow manual init later */
+            goto init_failed; // Treat failure to init manager here as fatal for extension load?
+        }
+    }
+    else
+    {
+        fprintf(stderr, "ZNS VFS INFO: ZNS mode not enabled or path not set at extension init time. Call sqlite3_wal_use_zns() to enable.\n");
+    }
+
+    fprintf(stderr, "ZNS VFS Extension: Initialization complete (rc=%d).\n", rc);
+    return rc;
+
+init_failed:
+    /* Clean up mutex if allocated and init failed */
+    if (zoneManager.mutex && !zoneManager.zZnsPath)
+    { // Only free if manager didn't fully init
+        sqlite3_mutex_free(zoneManager.mutex);
+        zoneManager.mutex = NULL;
+    }
+    return rc;
+}
+
+/*
+** Public API function to enable/disable ZNS mode and set the path.
+** This function MUST be called AFTER sqlite3_initialize() or loading the extension,
+** and BEFORE opening any database connections that should use ZNS WAL.
+*/
+SQLITE_API int sqlite3_wal_use_zns(const char *znsPath)
+{
+    int rc = SQLITE_OK;
+
+    fprintf(stderr, "ZNS VFS API: sqlite3_wal_use_zns called with path: %s\n", znsPath ? znsPath : "<null>");
+
+    /* Ensure the VFS is registered (it might not be default) */
+    if (!sqlite3_vfs_find("zns"))
+    {
+        fprintf(stderr, "ZNS VFS Error: 'zns' VFS not registered. Load the extension first.\n");
+        return SQLITE_ERROR; // Or SQLITE_MISUSE?
+    }
+    /* Ensure the mutex is created if not already (might happen if extension loaded but no path set) */
+    if (!zoneManager.mutex)
+    {
+        zoneManager.mutex = sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
+        if (!zoneManager.mutex)
+        {
+            fprintf(stderr, "ZNS VFS Error: Failed to allocate Zone Manager mutex in API call.\n");
+            return SQLITE_NOMEM;
+        }
+    }
+
+    if (znsPath == 0 || znsPath[0] == 0)
+    {
+        fprintf(stderr, "ZNS VFS API: Disabling ZNS mode.\n");
+        sqlite3WalEnableZnsSsd(0);  // Set global flag OFF
+        sqlite3WalSetZnsSsdPath(0); // Clear global path
+        znsZoneManagerDestroy();    // Clean up the manager
+        return SQLITE_OK;
+    }
+
+    /* Check if the provided path is a valid directory */
+    struct stat st;
+    if (stat(znsPath, &st) != 0)
+    {
+        fprintf(stderr, "ZNS VFS Error: Cannot stat ZNS path '%s': %s\n", znsPath, strerror(errno));
+        return SQLITE_CANTOPEN; // Path does not exist or other error
+    }
+    if (!S_ISDIR(st.st_mode))
+    {
+        fprintf(stderr, "ZNS VFS Error: ZNS path '%s' is not a directory.\n", znsPath);
+        return SQLITE_MISUSE; // Incorrect usage
+    }
+
+    /* Set the global path string (defined externally) */
     sqlite3WalSetZnsSsdPath(znsPath);
+    /* Enable the global flag (defined externally) */
     sqlite3WalEnableZnsSsd(1);
 
+    /* Initialize (or re-initialize if path changed) the Zone Manager */
+    rc = znsZoneManagerInit(znsPath);
+    if (rc != SQLITE_OK)
+    {
+        fprintf(stderr, "ZNS VFS Error: Failed to initialize Zone Manager for path '%s' (rc=%d).\n", znsPath, rc);
+        /* Disable ZNS mode again if manager init failed */
+        sqlite3WalEnableZnsSsd(0);
+        sqlite3WalSetZnsSsdPath(0);
+        return rc;
+    }
+
+    fprintf(stderr, "ZNS VFS API: Enabled ZNS mode with path: %s\n", znsPath);
     return SQLITE_OK;
 }
