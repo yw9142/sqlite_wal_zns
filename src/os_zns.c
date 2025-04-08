@@ -44,16 +44,6 @@ SQLITE_EXTENSION_INIT1
 #define BLKRESETZONE _IOW(0x12, 131, struct blk_zone_range)
 #endif
 
-/* Define blk_zone_range if not defined (e.g., older headers) */
-#ifndef HAVE_STRUCT_BLK_ZONE_RANGE
-struct blk_zone_range
-{
-    __u64 sector;
-    __u64 nr_sectors;
-};
-#define HAVE_STRUCT_BLK_ZONE_RANGE 1
-#endif
-
 /* ZNS Zone 관리를 위한 구조체 */
 typedef struct zns_zone_manager zns_zone_manager;
 struct zns_zone_manager
@@ -187,64 +177,43 @@ struct zns_vfs
 static int resetZnsZone(sqlite3_file *pFile)
 {
     zns_file *p = (zns_file *)pFile;
-    int fd = -1, rc = SQLITE_OK;
-    struct stat st;
-    struct blk_zone_range range = {0}; // Use the correct structure
+    int fd = -1; // Initialize fd to -1
+    int rc = SQLITE_OK;
+    // struct stat st; // stat is not needed if only resetting based on sector 0
+    struct blk_zone_range range = {0};
 
-    if (!p->isZnsWal || !p->pReal) // Check if it's a ZNS WAL and underlying file exists
-        return SQLITE_OK;          // Not applicable or already closed
+    if (!p->isZnsWal || !p->pReal || !p->zPath) // Check necessary pointers
+        return SQLITE_OK;
 
-    /* Get the file descriptor from the underlying file */
-    /* Note: This might fail if the underlying VFS doesn't support SQLITE_FCNTL_FILE_DESCRIPTOR */
-    rc = p->pReal->pMethods->xFileControl(p->pReal, SQLITE_FCNTL_FILE_DESCRIPTOR, &fd);
-    if (rc != SQLITE_OK || fd < 0)
+    /* Directly open the zone file path to get a file descriptor */
+    fd = open(p->zPath, O_RDWR);
+    if (fd < 0)
     {
-        fprintf(stderr, "ZNS VFS Error: Could not get file descriptor for zone reset (rc=%d, fd=%d)\n", rc, fd);
-        /* Try opening the path directly as a fallback? Might have permission issues */
-        fd = open(p->zPath, O_RDWR);
-        if (fd < 0)
-        {
-            fprintf(stderr, "ZNS VFS Error: Could not open zone file %s directly for reset: %s\n", p->zPath, strerror(errno));
-            return SQLITE_IOERR_ACCESS; // Indicate failure to access for reset
-        }
-        // If opened directly, remember to close it
+        fprintf(stderr, "ZNS VFS Error: Could not open zone file %s directly for reset: %s\n", p->zPath, strerror(errno));
+        return SQLITE_IOERR_ACCESS; // Indicate failure to access for reset
     }
 
-    /* Get file size to determine the range (assuming one zone per file) */
-    if (fstat(fd, &st) != 0)
-    {
-        fprintf(stderr, "ZNS VFS Error: fstat failed for fd %d (%s): %s\n", fd, p->zPath, strerror(errno));
-        rc = SQLITE_IOERR_FSTAT;
-        goto reset_zone_cleanup;
-    }
-
-    /* For BLKRESETZONE, range usually just needs the start sector.
-     * Setting nr_sectors might be ignored or required depending on kernel.
-     * Let's assume sector 0 is sufficient for resetting the whole zone mapped to the file. */
+    /* For BLKRESETZONE, range usually just needs the start sector (0). */
     range.sector = 0;
-    // range.nr_sectors = st.st_size / 512; // Typically 512 bytes/sector for ioctl
-    range.nr_sectors = 0; // Often ignored for zonefs files? Check zonefs/kernel docs. Let's try 0.
+    range.nr_sectors = 0; // Often ignored for zonefs files, set to 0
 
     /* Issue the correct ioctl for ZNS zone reset */
     if (ioctl(fd, BLKRESETZONE, &range) != 0)
     {
         fprintf(stderr, "ZNS VFS Error: BLKRESETZONE failed for fd %d (%s): %s\n", fd, p->zPath, strerror(errno));
         rc = SQLITE_IOERR_TRUNCATE; // Map the error appropriately
-        goto reset_zone_cleanup;
+        // Fall through to close fd
+    }
+    else
+    {
+        rc = SQLITE_OK;
+        // fprintf(stderr, "ZNS VFS DEBUG: Successfully reset zone for %s\n", p->zPath);
     }
 
-    rc = SQLITE_OK;
-    // fprintf(stderr, "ZNS VFS DEBUG: Successfully reset zone for %s\n", p->zPath);
-
-reset_zone_cleanup:
-    /* Close the fd ONLY if we opened it directly in the fallback */
-    if (rc != SQLITE_OK && fd >= 0 && p->pReal->pMethods->xFileControl(p->pReal, SQLITE_FCNTL_FILE_DESCRIPTOR, &fd) != SQLITE_OK)
+    // reset_zone_cleanup: // Label no longer strictly needed here
+    if (fd >= 0)
     {
-        close(fd);
-    }
-    else if (fd >= 0 && p->pReal->pMethods->xFileControl(p->pReal, SQLITE_FCNTL_FILE_DESCRIPTOR, &fd) != SQLITE_OK)
-    {
-        close(fd); // Close if opened directly even on success
+        close(fd); // Always close the fd we opened
     }
 
     return rc;
@@ -1095,6 +1064,7 @@ static int znsCurrentTimeInt64(sqlite3_vfs *pVfs, sqlite3_int64 *pTimeOut)
         return rc;
     }
 }
+
 static int znsGetLastError(sqlite3_vfs *pVfs, int iErrno, char *zErrstr)
 {
     zns_vfs *pZnsVfs = (zns_vfs *)pVfs->pAppData;
@@ -1106,7 +1076,8 @@ static int znsGetLastError(sqlite3_vfs *pVfs, int iErrno, char *zErrstr)
     /* Provide a generic message if the underlying VFS doesn't support it */
     if (zErrstr)
     {
-        sqlite3_snprintf(SQLITE_MSG_SIZE, zErrstr, "System call error number %d", iErrno);
+        // Use a fixed reasonable size like 512 for the buffer length
+        sqlite3_snprintf(512, zErrstr, "System call error number %d", iErrno);
     }
     return iErrno;
 }
