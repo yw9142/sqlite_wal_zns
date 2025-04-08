@@ -65,7 +65,7 @@ static zns_zone_manager zoneManager = {0};
 /* Forward declarations */
 static sqlite3_vfs *pOrigVfs = 0; /* Pointer to the original VFS */
 static int znsVfsInit(sqlite3_vfs *);
-static char *znsGetFreeZoneFile(const char *zWalName); // Helper declaration
+static char *znsGetFreeZoneFile(const char *zWalName, const char *currentZnsPath); // Helper declaration
 static void znsZoneManagerDestroy(void);
 
 /* External declarations (must be defined elsewhere, e.g., in wal.c or main app) */
@@ -1345,7 +1345,7 @@ static void znsZoneManagerDestroy(void)
 ** Returns: Full path to the allocated zone file (e.g., /zonefs/mount/0001)
 **          or NULL if none available or error.
 */
-static char *znsGetFreeZoneFile(const char *zWalName)
+static char *znsGetFreeZoneFile(const char *zWalName, const char *currentZnsPath)
 {
     int i;
     char *zZoneFile = NULL;
