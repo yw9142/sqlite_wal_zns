@@ -279,13 +279,13 @@ const char *sqlite3WalGetZnsSsdPath(void)
 /* ZNS SSD 사용 여부 설정 */
 void sqlite3WalEnableZnsSsd(int enable)
 {
-  useZnsSsd = enable;
+  useZnsSsd = enable ? 1 : 0;
 }
 
 /* ZNS SSD 사용 여부 확인 */
 int sqlite3WalUseZnsSsd(void)
 {
-  return useZnsSsd && znsWalPath != 0;
+  return useZnsSsd;
 }
 
 /* 설정된 ZNS SSD 경로에 맞는 WAL 파일 경로 생성

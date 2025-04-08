@@ -30,6 +30,30 @@ SQLITE_EXTENSION_INIT1
 #include <sys/ioctl.h>
 #include <errno.h>
 #include <linux/fs.h>
+#include <linux/blkzoned.h>
+#include <dirent.h>
+
+/* ZNS 관련 상수 정의 - 시스템에 없을 경우 대체 정의 */
+#ifndef BLKRESETZONE
+#define BLKRESETZONE _IOW(0x12, 103, struct blk_zone_range)
+#endif
+
+/* ZNS Zone 관리를 위한 구조체 */
+typedef struct zns_zone_manager zns_zone_manager;
+struct zns_zone_manager
+{
+    char *zZnsPath;       /* ZNS SSD 경로 (zonefs 마운트 포인트) */
+    int nZones;           /* 사용 가능한 Zone의 수 */
+    int *aZoneState;      /* Zone 사용 상태 (0: 미사용, 1: 사용 중) */
+    char **aZoneFiles;    /* Zone 파일 경로 배열 */
+    sqlite3_mutex *mutex; /* Zone 관리 뮤텍스 */
+};
+
+/* 전역 Zone 관리자 */
+static zns_zone_manager zoneManager = {0};
+
+/* zone file name에서 zonefs에서 사용하는 파일 형식 */
+#define ZONEFS_SEQ_FILE_PATTERN "%04x"
 
 /* Forward declarations */
 static sqlite3_vfs *pOrigVfs = 0; /* Pointer to the original VFS */
@@ -259,16 +283,52 @@ static int znsWrite(
     sqlite3_int64 iOfst)
 {
     zns_file *p = (zns_file *)pFile;
+    int rc;
 
-    /* Special handling for WAL files on ZNS SSD */
+    /* ZNS SSD WAL 파일의 경우 특별 처리 */
     if (p->isZnsWal)
     {
-        /* For ZNS SSD WAL files, we want to ensure sequential writes.
-        ** This could include additional optimizations specific to ZNS characteristics.
-        ** For now, we just pass through to the real implementation.
-        */
+        int fd;
+        i64 iSize;
+
+        /* 파일 디스크립터 얻기 */
+        rc = p->pReal->pMethods->xFileControl(p->pReal, SQLITE_FCNTL_FILE_DESCRIPTOR, &fd);
+        if (rc != SQLITE_OK)
+            return rc;
+
+        /* 현재 파일 크기 확인 */
+        rc = p->pReal->pMethods->xFileSize(p->pReal, &iSize);
+        if (rc != SQLITE_OK)
+            return rc;
+
+        /* ZNS에서는 항상 순차적 쓰기가 필요함 */
+        if (iOfst != iSize)
+        {
+            /* WAL 파일의 헤더 업데이트 등을 처리하기 위한 특별 케이스 */
+            if (iOfst < 32)
+            { /* WAL 헤더 크기는 32바이트 */
+                /* WAL 헤더 쓰기는 허용 */
+                return p->pReal->pMethods->xWrite(p->pReal, zBuf, iAmt, iOfst);
+            }
+
+            /* 그 외에는 순차 쓰기만 허용 - iOfst가 현재 크기와 다르면 에러 */
+            return SQLITE_IOERR_WRITE;
+        }
+
+        /* 순차 쓰기 - zonefs에서는 항상 append 모드로 쓰기 */
+        rc = p->pReal->pMethods->xWrite(p->pReal, zBuf, iAmt, iOfst);
+
+        /* Zone이 가득 찼을 때 처리 */
+        if (rc == SQLITE_FULL || rc == SQLITE_IOERR_WRITE)
+        {
+            /* 여기에서 새로운 Zone을 할당하는 로직을 구현할 수 있음 */
+            /* 이 구현에서는 상위 레이어(WAL)가 에러를 받아 체크포인트를 수행하도록 함 */
+        }
+
+        return rc;
     }
 
+    /* ZNS가 아닌 파일은 원래 VFS로 처리 */
     return p->pReal->pMethods->xWrite(p->pReal, zBuf, iAmt, iOfst);
 }
 
@@ -492,6 +552,7 @@ static int znsOpen(
     zns_vfs *pZnsVfs = (zns_vfs *)pVfs;
     int rc = SQLITE_OK;
     char *zZnsPath = NULL;
+    char *zZoneFile = NULL;
     int isWal = 0;
     int isZnsWal = 0;
 
@@ -500,14 +561,24 @@ static int znsOpen(
     {
         isWal = 1;
 
-        /* If ZNS mode is enabled, check if we should redirect this WAL file */
+        /* 만약 ZNS 모드가 활성화된 경우 */
         if (sqlite3WalUseZnsSsd())
         {
-            zZnsPath = getZnsWalPath(zName);
-            if (zZnsPath)
+            /* 기존 구현: zName 경로를 ZNS 경로로 변환 */
+            /* 그러나 zonefs에서는 임의 파일명 생성이 불가능하므로
+             * 사용 가능한 존 파일을 찾아야 함 */
+            zZoneFile = znsGetFreeZoneFile(zName);
+
+            if (zZoneFile)
             {
-                zName = zZnsPath;
+                /* 존 파일을 찾았다면 이 경로를 대신 사용 */
+                zName = zZoneFile;
                 isZnsWal = 1;
+            }
+            else
+            {
+                /* 사용 가능한 존 파일이 없으면 원래 경로 사용 */
+                return SQLITE_FULL;
             }
         }
     }
@@ -517,17 +588,37 @@ static int znsOpen(
     p->pReal = (sqlite3_file *)&p[1]; /* Real file structure is stored right after */
 
     /* Open the underlying file using the original VFS */
-    rc = pZnsVfs->pRealVfs->xOpen(pZnsVfs->pRealVfs, zName, p->pReal, flags, pOutFlags);
+    /* zonefs에서는 파일을 생성할 수 없고, O_CREAT 플래그를 제거해야 함 */
+    int modifiedFlags = flags;
+    if (isZnsWal)
+    {
+        modifiedFlags &= ~(SQLITE_OPEN_CREATE | SQLITE_OPEN_DELETEONCLOSE);
+    }
+
+    rc = pZnsVfs->pRealVfs->xOpen(pZnsVfs->pRealVfs, zName, p->pReal, modifiedFlags, pOutFlags);
     if (rc != SQLITE_OK)
     {
-        sqlite3_free(zZnsPath);
+        if (isZnsWal && zZoneFile)
+        {
+            /* 열기 실패 시 상태를 '미사용'으로 되돌림 */
+            sqlite3_mutex_enter(zoneManager.mutex);
+            for (int i = 0; i < zoneManager.nZones; i++)
+            {
+                if (zoneManager.aZoneFiles[i] == zZoneFile)
+                {
+                    zoneManager.aZoneState[i] = 0; /* 미사용 상태로 변경 */
+                    break;
+                }
+            }
+            sqlite3_mutex_leave(zoneManager.mutex);
+        }
         return rc;
     }
 
     /* Save the file information */
     p->isWal = isWal;
     p->isZnsWal = isZnsWal;
-    p->zPath = zZnsPath ? zZnsPath : (zName ? sqlite3_mprintf("%s", zName) : NULL);
+    p->zPath = zZoneFile ? sqlite3_mprintf("%s", zZoneFile) : (zName ? sqlite3_mprintf("%s", zName) : NULL);
 
     /* Set up the zns-file methods */
     p->base.pMethods = &zns_file_methods;
@@ -740,6 +831,176 @@ static int znsGetLastError(sqlite3_vfs *pVfs, int nBuf, char *zBuf)
         return pZnsVfs->pRealVfs->xGetLastError(pZnsVfs->pRealVfs, nBuf, zBuf);
     }
     return 0;
+}
+
+/*
+** Zone 관리자 초기화 함수
+*/
+static int znsZoneManagerInit(const char *zZnsPath)
+{
+    DIR *dir;
+    struct dirent *entry;
+    int nZones = 0;
+    char **aFiles = NULL;
+    int i = 0;
+
+    if (!zZnsPath || !zZnsPath[0])
+        return SQLITE_ERROR;
+
+    /* 이미 초기화된 경우 */
+    if (zoneManager.zZnsPath)
+        return SQLITE_OK;
+
+    /* ZNS 경로 열기 */
+    dir = opendir(zZnsPath);
+    if (!dir)
+        return SQLITE_ERROR;
+
+    /* 존 파일 개수 세기 (zonefs의 형식은 일반적으로 0000, 0001, ... 의 형식) */
+    while ((entry = readdir(dir)) != NULL)
+    {
+        if (entry->d_type == DT_REG)
+        {
+            unsigned int zoneNum;
+            /* 16진수 형식으로 된 파일 이름인지 확인 (예: "0000") */
+            if (sscanf(entry->d_name, ZONEFS_SEQ_FILE_PATTERN, &zoneNum) == 1)
+            {
+                nZones++;
+            }
+        }
+    }
+    rewinddir(dir);
+
+    /* 메모리 할당 */
+    zoneManager.zZnsPath = sqlite3_mprintf("%s", zZnsPath);
+    zoneManager.nZones = nZones;
+    zoneManager.aZoneState = sqlite3_malloc(sizeof(int) * nZones);
+    zoneManager.aZoneFiles = sqlite3_malloc(sizeof(char *) * nZones);
+    zoneManager.mutex = sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
+
+    if (!zoneManager.zZnsPath || !zoneManager.aZoneState ||
+        !zoneManager.aZoneFiles || !zoneManager.mutex)
+    {
+        /* 메모리 할당 실패 시 정리 */
+        sqlite3_free(zoneManager.zZnsPath);
+        sqlite3_free(zoneManager.aZoneState);
+        sqlite3_free(zoneManager.aZoneFiles);
+        if (zoneManager.mutex)
+            sqlite3_mutex_free(zoneManager.mutex);
+
+        memset(&zoneManager, 0, sizeof(zoneManager));
+        closedir(dir);
+        return SQLITE_NOMEM;
+    }
+
+    /* 초기값 설정 */
+    memset(zoneManager.aZoneState, 0, sizeof(int) * nZones);
+    memset(zoneManager.aZoneFiles, 0, sizeof(char *) * nZones);
+
+    /* 존 파일들의 경로를 저장 */
+    i = 0;
+    while ((entry = readdir(dir)) != NULL && i < nZones)
+    {
+        if (entry->d_type == DT_REG)
+        {
+            unsigned int zoneNum;
+            if (sscanf(entry->d_name, ZONEFS_SEQ_FILE_PATTERN, &zoneNum) == 1)
+            {
+                zoneManager.aZoneFiles[i] = sqlite3_mprintf(
+                    "%s/%s", zZnsPath, entry->d_name);
+                i++;
+            }
+        }
+    }
+    closedir(dir);
+
+    return SQLITE_OK;
+}
+
+/*
+** Zone 관리자 해제 함수
+*/
+static void znsZoneManagerDestroy(void)
+{
+    int i;
+
+    if (!zoneManager.zZnsPath)
+        return;
+
+    sqlite3_mutex_enter(zoneManager.mutex);
+
+    sqlite3_free(zoneManager.zZnsPath);
+    sqlite3_free(zoneManager.aZoneState);
+
+    for (i = 0; i < zoneManager.nZones; i++)
+    {
+        sqlite3_free(zoneManager.aZoneFiles[i]);
+    }
+    sqlite3_free(zoneManager.aZoneFiles);
+
+    sqlite3_mutex_leave(zoneManager.mutex);
+    sqlite3_mutex_free(zoneManager.mutex);
+
+    memset(&zoneManager, 0, sizeof(zoneManager));
+}
+
+/*
+** 사용 가능한 zone 파일 찾기
+*/
+static char *znsGetFreeZoneFile(const char *zWalName)
+{
+    int i;
+    char *zZoneFile = NULL;
+
+    if (!zoneManager.zZnsPath || !zoneManager.aZoneFiles)
+    {
+        znsZoneManagerInit(sqlite3WalGetZnsSsdPath());
+    }
+
+    if (!zoneManager.zZnsPath || !zoneManager.aZoneFiles)
+    {
+        return NULL;
+    }
+
+    sqlite3_mutex_enter(zoneManager.mutex);
+
+    /* 이미 이 WAL 파일용으로 할당된 Zone이 있는지 확인 */
+    for (i = 0; i < zoneManager.nZones; i++)
+    {
+        if (zoneManager.aZoneState[i] == 2)
+        {
+            /* WAL 파일 이름이 마지막 경로 성분만 비교 */
+            const char *zBaseName = strrchr(zWalName, '/');
+            zBaseName = zBaseName ? zBaseName + 1 : zWalName;
+
+            const char *zZoneBaseName = strrchr(zoneManager.aZoneFiles[i], '/');
+            zZoneBaseName = zZoneBaseName ? zZoneBaseName + 1 : zoneManager.aZoneFiles[i];
+
+            /* 이미 사용 중인 zone 파일 반환 */
+            if (strcmp(zBaseName, zZoneBaseName) == 0)
+            {
+                zZoneFile = zoneManager.aZoneFiles[i];
+                break;
+            }
+        }
+    }
+
+    /* 사용 가능한 Zone 찾기 */
+    if (!zZoneFile)
+    {
+        for (i = 0; i < zoneManager.nZones; i++)
+        {
+            if (zoneManager.aZoneState[i] == 0)
+            {
+                zoneManager.aZoneState[i] = 1; /* 사용 중 표시 */
+                zZoneFile = zoneManager.aZoneFiles[i];
+                break;
+            }
+        }
+    }
+
+    sqlite3_mutex_leave(zoneManager.mutex);
+    return zZoneFile;
 }
 
 /*
