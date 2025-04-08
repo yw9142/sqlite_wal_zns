@@ -9,8 +9,8 @@
 **    May you share freely, never taking more than you give.
 **
 *************************************************************************
-** This header file defines the interface to the write-ahead logging 
-** system. Refer to the comments below and the header comment attached to 
+** This header file defines the interface to the write-ahead logging
+** system. Refer to the comments below and the header comment attached to
 ** the implementation of each function in log.c for further details.
 */
 
@@ -19,50 +19,63 @@
 
 #include "sqliteInt.h"
 
+/* ZNS SSD 관련 설정 추가 */
+#ifndef SQLITE_OMIT_WAL
+void sqlite3WalSetZnsSsdPath(const char *zPath);
+const char *sqlite3WalGetZnsSsdPath(void);
+int sqlite3WalUseZnsSsd(void);
+void sqlite3WalEnableZnsSsd(int enable);
+#else
+#define sqlite3WalSetZnsSsdPath(x)
+#define sqlite3WalGetZnsSsdPath() 0
+#define sqlite3WalUseZnsSsd() 0
+#define sqlite3WalEnableZnsSsd(x)
+#endif
+
 /* Macros for extracting appropriate sync flags for either transaction
 ** commits (WAL_SYNC_FLAGS(X)) or for checkpoint ops (CKPT_SYNC_FLAGS(X)):
 */
-#define WAL_SYNC_FLAGS(X)   ((X)&0x03)
-#define CKPT_SYNC_FLAGS(X)  (((X)>>2)&0x03)
+#define WAL_SYNC_FLAGS(X) ((X) & 0x03)
+#define CKPT_SYNC_FLAGS(X) (((X) >> 2) & 0x03)
 
 #ifdef SQLITE_OMIT_WAL
-# define sqlite3WalOpen(x,y,z)                   0
-# define sqlite3WalLimit(x,y)
-# define sqlite3WalClose(v,w,x,y,z)              0
-# define sqlite3WalBeginReadTransaction(y,z)     0
-# define sqlite3WalEndReadTransaction(z)
-# define sqlite3WalDbsize(y)                     0
-# define sqlite3WalBeginWriteTransaction(y)      0
-# define sqlite3WalEndWriteTransaction(x)        0
-# define sqlite3WalUndo(x,y,z)                   0
-# define sqlite3WalSavepoint(y,z)
-# define sqlite3WalSavepointUndo(y,z)            0
-# define sqlite3WalFrames(u,v,w,x,y,z)           0
-# define sqlite3WalCheckpoint(q,r,s,t,u,v,w,x,y,z) 0
-# define sqlite3WalCallback(z)                   0
-# define sqlite3WalExclusiveMode(y,z)            0
-# define sqlite3WalHeapMemory(z)                 0
-# define sqlite3WalFramesize(z)                  0
-# define sqlite3WalFindFrame(x,y,z)              0
-# define sqlite3WalFile(x)                       0
-# undef SQLITE_USE_SEH
+#define sqlite3WalOpen(x, y, z) 0
+#define sqlite3WalLimit(x, y)
+#define sqlite3WalClose(v, w, x, y, z) 0
+#define sqlite3WalBeginReadTransaction(y, z) 0
+#define sqlite3WalEndReadTransaction(z)
+#define sqlite3WalDbsize(y) 0
+#define sqlite3WalBeginWriteTransaction(y) 0
+#define sqlite3WalEndWriteTransaction(x) 0
+#define sqlite3WalUndo(x, y, z) 0
+#define sqlite3WalSavepoint(y, z)
+#define sqlite3WalSavepointUndo(y, z) 0
+#define sqlite3WalFrames(u, v, w, x, y, z) 0
+#define sqlite3WalCheckpoint(q, r, s, t, u, v, w, x, y, z) 0
+#define sqlite3WalCallback(z) 0
+#define sqlite3WalExclusiveMode(y, z) 0
+#define sqlite3WalHeapMemory(z) 0
+#define sqlite3WalFramesize(z) 0
+#define sqlite3WalFindFrame(x, y, z) 0
+#define sqlite3WalFile(x) 0
+#undef SQLITE_USE_SEH
 #else
 
 #define WAL_SAVEPOINT_NDATA 4
 
-/* Connection to a write-ahead log (WAL) file. 
-** There is one object of this type for each pager. 
+/* Connection to a write-ahead log (WAL) file.
+** There is one object of this type for each pager.
 */
 typedef struct Wal Wal;
 
 /* Open and close a connection to a write-ahead log. */
-int sqlite3WalOpen(sqlite3_vfs*, sqlite3_file*, const char *, int, i64, Wal**);
-int sqlite3WalClose(Wal *pWal, sqlite3*, int sync_flags, int, u8 *);
+int sqlite3WalOpen(sqlite3_vfs *, sqlite3_file *, const char *, int, i64, Wal **);
+int sqlite3WalClose(Wal *pWal, sqlite3 *, int sync_flags, int, u8 *);
 
 /* Set the limiting size of a WAL file. */
-void sqlite3WalLimit(Wal*, i64);
+void sqlite3WalLimit(Wal *, i64);
 
-/* Used by readers to open (lock) and close (unlock) a snapshot.  A 
+/* Used by readers to open (lock) and close (unlock) a snapshot.  A
 ** snapshot is like a read-transaction.  It is the state of the database
 ** at an instant in time.  sqlite3WalOpenSnapshot gets a read lock and
 ** preserves the current state even if the other threads or processes
@@ -97,18 +110,18 @@ int sqlite3WalSavepointUndo(Wal *pWal, u32 *aWalData);
 /* Write a frame or frames to the log. */
 int sqlite3WalFrames(Wal *pWal, int, PgHdr *, Pgno, int, int);
 
-/* Copy pages from the log to the database file */ 
+/* Copy pages from the log to the database file */
 int sqlite3WalCheckpoint(
-  Wal *pWal,                      /* Write-ahead log connection */
-  sqlite3 *db,                    /* Check this handle's interrupt flag */
-  int eMode,                      /* One of PASSIVE, FULL and RESTART */
-  int (*xBusy)(void*),            /* Function to call when busy */
-  void *pBusyArg,                 /* Context argument for xBusyHandler */
-  int sync_flags,                 /* Flags to sync db file with (or 0) */
-  int nBuf,                       /* Size of buffer nBuf */
-  u8 *zBuf,                       /* Temporary buffer to use */
-  int *pnLog,                     /* OUT: Number of frames in WAL */
-  int *pnCkpt                     /* OUT: Number of backfilled frames in WAL */
+    Wal *pWal,            /* Write-ahead log connection */
+    sqlite3 *db,          /* Check this handle's interrupt flag */
+    int eMode,            /* One of PASSIVE, FULL and RESTART */
+    int (*xBusy)(void *), /* Function to call when busy */
+    void *pBusyArg,       /* Context argument for xBusyHandler */
+    int sync_flags,       /* Flags to sync db file with (or 0) */
+    int nBuf,             /* Size of buffer nBuf */
+    u8 *zBuf,             /* Temporary buffer to use */
+    int *pnLog,           /* OUT: Number of frames in WAL */
+    int *pnCkpt           /* OUT: Number of backfilled frames in WAL */
 );
 
 /* Return the value to pass to a sqlite3_wal_hook callback, the
@@ -125,7 +138,7 @@ int sqlite3WalExclusiveMode(Wal *pWal, int op);
 
 /* Return true if the argument is non-NULL and the WAL module is using
 ** heap-memory for the wal-index. Otherwise, if the argument is NULL or the
-** WAL module is using shared-memory, return false. 
+** WAL module is using shared-memory, return false.
 */
 int sqlite3WalHeapMemory(Wal *pWal);
 
@@ -153,7 +166,7 @@ void sqlite3WalDb(Wal *pWal, sqlite3 *db);
 #endif
 
 #ifdef SQLITE_USE_SEH
-int sqlite3WalSystemErrno(Wal*);
+int sqlite3WalSystemErrno(Wal *);
 #endif
 
 #endif /* ifndef SQLITE_OMIT_WAL */
