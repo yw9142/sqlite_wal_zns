@@ -690,11 +690,16 @@ static int znsOpen(
         return SQLITE_ERROR; // Should not happen if init was ok
 
     /* Determine if this is potentially a WAL file to be handled by ZNS */
-    if (zOrigName && (flags & SQLITE_OPEN_WAL) && sqlite3WalUseZnsSsd())
+    if (zOrigName && (flags & SQLITE_OPEN_WAL) && sqlite3WalUseZnsSsd_internal())
     {
         isWal = 1;
         // fprintf(stderr, "ZNS VFS DEBUG: Attempting to open potential WAL file: %s\n", zOrigName);
-        zZoneFile = znsGetFreeZoneFile(zOrigName); // Find or allocate a zone
+        const char *currentZnsPath = sqlite3WalGetZnsSsdPath_internal(); // 경로도 _internal 사용
+        if (!currentZnsPath)
+        { /* 오류 처리 */
+            return SQLITE_ERROR;
+        }
+        zZoneFile = znsGetFreeZoneFile(zOrigName, currentZnsPath); // 경로 전달
 
         if (zZoneFile)
         {
@@ -831,7 +836,7 @@ static int znsDelete(sqlite3_vfs *pVfs, const char *zPath, int dirSync)
 
     /* Check if it's a WAL file potentially handled by ZNS */
     /* Use sqlite3_uri_boolean to check for "-wal" suffix robustly? No, simple check is fine. */
-    if (zPath && sqlite3WalUseZnsSsd())
+    if (zPath && sqlite3WalUseZnsSsd_internal())
     {
         int nPath = strlen(zPath);
         if (nPath > 4 && sqlite3_strnicmp(&zPath[nPath - 4], "-wal", 4) == 0)
@@ -945,7 +950,7 @@ static int znsAccess(
     int i;
 
     /* Check if it's a WAL file potentially handled by ZNS */
-    if (zPath && sqlite3WalUseZnsSsd())
+    if (zPath && sqlite3WalUseZnsSsd_internal())
     {
         int nPath = strlen(zPath);
         if (nPath > 4 && sqlite3_strnicmp(&zPath[nPath - 4], "-wal", 4) == 0)
