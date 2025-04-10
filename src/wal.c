@@ -336,7 +336,7 @@ static char *walGetZnsWalPath(const char *zWalName)
 ** ZoneFS에서는 파일을 0바이트로 truncate하는 것이
 ** 해당 Zone을 Reset하는 일반적인 방법일 수 있습니다.
 */
-static int walResetZnsZone(sqlite3_file *pWalFd)
+static int walResetZnsZone(Wal *pWal)
 {
   int rc = SQLITE_OK;
 
@@ -348,7 +348,8 @@ static int walResetZnsZone(sqlite3_file *pWalFd)
     if (rc != SQLITE_OK)
     {
       // Truncate 실패 시 로그 기록 또는 추가 오류 처리
-      sqlite3_log(rc, "Failed to truncate WAL file for Zone Reset: %s", sqlite3OsFullPathname(pWalFd));
+      sqlite3_log(rc, "Failed to truncate WAL file for Zone Reset: %s",
+                  sqlite3OsFullPathname(pWal->pVfs, pWal->zWalName));
     }
   }
   else
@@ -356,6 +357,11 @@ static int walResetZnsZone(sqlite3_file *pWalFd)
     // ZNS 미사용 시 기존 로직 (아무것도 안 함)
     // 또는 필요시 일반 truncate 호출
     rc = sqlite3OsTruncate(pWalFd, 0); // ZNS 미사용 시에도 truncate는 필요할 수 있음
+    if (rc != SQLITE_OK)
+    {
+      sqlite3_log(rc, "Failed to truncate WAL file: %s",
+                  sqlite3OsFullPathname(pWal->pVfs, pWal->zWalName));
+    }
   }
 
   return rc;
@@ -2758,7 +2764,7 @@ static void walLimitSize(Wal *pWal, i64 nMax)
       if (nMax == 0) // Is it a request to reset (limit 0)?
       {
         /* In ZNS mode, a limit of 0 means reset the zone */
-        rx = walResetZnsZone(pWal->pWalFd); // Attempts truncate(0)
+        rx = walResetZnsZone(pWal); // Attempts truncate(0)
       }
       else // It's a request for a positive limit in ZNS mode (unsupported)
       {
@@ -4437,7 +4443,7 @@ static int walRestartLog(Wal *pWal)
   }
 
   /* If we get to here, then the log can be restarted. */
-  rc = walResetZnsZone(pWal->pWalFd); // truncate(0) 호출
+  rc = walResetZnsZone(pWal); // truncate(0) 호출
 
   if (rc == SQLITE_OK)
   {
