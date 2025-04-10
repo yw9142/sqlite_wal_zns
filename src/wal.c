@@ -344,7 +344,7 @@ static int walResetZnsZone(Wal *pWal)
   if (sqlite3WalUseZnsSsd())
   {
     /* ZoneFS 환경에서는 truncate(0)이 Zone Reset을 유발할 수 있음 */
-    rc = sqlite3OsTruncate(pWalFd, 0);
+    rc = sqlite3OsTruncate(pWal->pWalFd, 0);
     if (rc != SQLITE_OK)
     {
       // Truncate 실패 시 로그 기록 또는 추가 오류 처리
@@ -356,7 +356,7 @@ static int walResetZnsZone(Wal *pWal)
   {
     // ZNS 미사용 시 기존 로직 (아무것도 안 함)
     // 또는 필요시 일반 truncate 호출
-    rc = sqlite3OsTruncate(pWalFd, 0); // ZNS 미사용 시에도 truncate는 필요할 수 있음
+    rc = sqlite3OsTruncate(pWal->pWalFd, 0); // ZNS 미사용 시에도 truncate는 필요할 수 있음
     if (rc != SQLITE_OK)
     {
       sqlite3_log(rc, "Failed to truncate WAL file: %s",
