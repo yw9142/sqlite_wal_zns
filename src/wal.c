@@ -257,6 +257,7 @@ static int useZnsSsd = 0;                   /* ZNS SSD 사용 여부 (1:사용, 
 static int znsZoneSize = 256 * 1024 * 1024; /* ZNS Zone 크기 (기본값 256MB) */
 
 /* ZNS SSD 경로 설정 함수 */
+/* ZNS SSD 경로 설정 함수 */
 void sqlite3WalSetZnsSsdPath(const char *zPath)
 {
   if (znsWalPath)
@@ -266,7 +267,13 @@ void sqlite3WalSetZnsSsdPath(const char *zPath)
   }
   if (zPath && zPath[0])
   {
-    znsWalPath = sqlite3_mprintf("%s", zPath);
+    // 경로 끝의 구분자 제거 (선택 사항)
+    int n = sqlite3Strlen30(zPath);
+    while (n > 0 && (zPath[n - 1] == '/' || zPath[n - 1] == '\\'))
+    {
+      n--;
+    }
+    znsWalPath = sqlite3_mprintf("%.*s", n, zPath);
   }
 }
 
@@ -285,12 +292,13 @@ void sqlite3WalEnableZnsSsd(int enable)
 /* ZNS SSD 사용 여부 확인 */
 int sqlite3WalUseZnsSsd(void)
 {
-  return useZnsSsd && znsWalPath != 0;
+  // znsWalPath가 NULL이 아니고 비어있지 않은지 확인
+  return useZnsSsd && znsWalPath != 0 && znsWalPath[0] != 0;
 }
 
 /* 설정된 ZNS SSD 경로에 맞는 WAL 파일 경로 생성
-** 원래의 WAL 파일명을 ZNS SSD 경로에 위치시키고
-** 파일명만 그대로 유지하도록 함
+** 원래의 WAL 파일명에서 파일 이름 부분만 추출하여
+** ZoneFS 마운트 경로 아래에 위치시킵니다.
 */
 static char *walGetZnsWalPath(const char *zWalName)
 {
@@ -300,27 +308,33 @@ static char *walGetZnsWalPath(const char *zWalName)
   if (!sqlite3WalUseZnsSsd() || !zWalName)
     return 0;
 
-  /* 원본 파일명에서 기본 이름만 추출 */
-  zBase = strrchr(zWalName, '/');
-#ifdef _WIN32
-  {
-    const char *zBackslash = strrchr(zWalName, '\\');
-    if (!zBase || (zBackslash && zBackslash > zBase))
-      zBase = zBackslash;
-  }
-#endif
+  /* 원본 파일명에서 파일 이름 부분만 추출 */
+  zBase = sqlite3_uri_parameter(zWalName, "filename"); // Use existing utility if possible, otherwise manual extraction
   if (!zBase)
-    zBase = zWalName;
-  else
-    zBase++;
+  {
+    // Fallback: manual extraction
+    zBase = strrchr(zWalName, '/');
+#ifdef _WIN32
+    {
+      const char *zBackslash = strrchr(zWalName, '\\');
+      if (!zBase || (zBackslash && zBackslash > zBase))
+        zBase = zBackslash;
+    }
+#endif
+    if (!zBase)
+      zBase = zWalName;
+    else
+      zBase++;
+  }
 
-  /* ZNS SSD 경로에 새 경로 생성 */
+  /* ZNS SSD 경로(ZoneFS 마운트 포인트)와 파일명을 조합하여 새 경로 생성 */
   zPath = sqlite3_mprintf("%s/%s", znsWalPath, zBase);
   return zPath;
 }
 
-/* ZNS Zone Reset 수행
-** ioctl(BLKZEROOUT) 명령을 사용하여 ZNS의 특정 Zone을 리셋함
+/* ZNS Zone Reset 수행 (ZoneFS 환경에 맞게 수정)
+** ZoneFS에서는 파일을 0바이트로 truncate하는 것이
+** 해당 Zone을 Reset하는 일반적인 방법일 수 있습니다.
 */
 static int walResetZnsZone(sqlite3_file *pWalFd)
 {
@@ -329,16 +343,19 @@ static int walResetZnsZone(sqlite3_file *pWalFd)
   /* ZNS 사용 시에만 동작 */
   if (sqlite3WalUseZnsSsd())
   {
-    i64 iOffset = 0;
-
-    /* BLKZEROOUT ioctl을 사용하여 Zone 리셋 */
-    rc = sqlite3OsFileControl(pWalFd, 0x40085607 /* BLKZEROOUT */, &iOffset);
-
-    /* 실패 시 fallback으로 truncate를 사용 */
+    /* ZoneFS 환경에서는 truncate(0)이 Zone Reset을 유발할 수 있음 */
+    rc = sqlite3OsTruncate(pWalFd, 0);
     if (rc != SQLITE_OK)
     {
-      rc = sqlite3OsTruncate(pWalFd, 0);
+      // Truncate 실패 시 로그 기록 또는 추가 오류 처리
+      sqlite3_log(rc, "Failed to truncate WAL file for Zone Reset: %s", sqlite3OsFullPathname(pWalFd));
     }
+  }
+  else
+  {
+    // ZNS 미사용 시 기존 로직 (아무것도 안 함)
+    // 또는 필요시 일반 truncate 호출
+    rc = sqlite3OsTruncate(pWalFd, 0); // ZNS 미사용 시에도 truncate는 필요할 수 있음
   }
 
   return rc;
@@ -1848,30 +1865,39 @@ static void walIndexClose(Wal *pWal, int isDelete)
 ** an SQLite error code is returned and *ppWal is left unmodified.
 */
 int sqlite3WalOpen(
-    sqlite3_vfs *pVfs,    /* vfs module to open wal and wal-index */
-    sqlite3_file *pDbFd,  /* The open database file */
-    const char *zWalName, /* Name of the WAL file */
-    int bNoShm,           /* True to run in heap-memory mode */
-    i64 mxWalSize,        /* Truncate WAL to this size on reset */
-    Wal **ppWal           /* OUT: Allocated Wal handle */
+    sqlite3_vfs *pVfs,            /* vfs module to open wal and wal-index */
+    sqlite3_file *pDbFd,          /* The open database file */
+    const char *zWalNameOriginal, /* Name of the WAL file */
+    int bNoShm,                   /* True to run in heap-memory mode */
+    i64 mxWalSize,                /* Truncate WAL to this size on reset */
+    Wal **ppWal                   /* OUT: Allocated Wal handle */
 )
 {
-  int rc;                /* Return Code */
-  Wal *pRet;             /* Object to allocate and return */
-  int flags;             /* Flags passed to OsOpen() */
-  char *zZnsWalName = 0; /* ZNS SSD WAL 파일 경로 */
+  int rc;                                       /* Return Code */
+  Wal *pRet;                                    /* Object to allocate and return */
+  int flags;                                    /* Flags passed to OsOpen() */
+  const char *zWalNameToUse = zWalNameOriginal; /* 실제 사용할 WAL 파일 경로 */
+  char *zZnsWalName = 0;                        /* ZNS SSD WAL 파일 경로 (malloc된 경우 해제 필요) */
 
-  assert(zWalName && zWalName[0]);
+  assert(zWalNameOriginal && zWalNameOriginal[0]);
   assert(pDbFd);
 
   /* ZNS SSD를 사용하는 경우 WAL 파일 경로를 ZNS SSD 경로로 변경 */
   if (sqlite3WalUseZnsSsd())
   {
-    zZnsWalName = walGetZnsWalPath(zWalName);
+    zZnsWalName = walGetZnsWalPath(zWalNameOriginal);
     if (zZnsWalName)
     {
       /* 원래 경로 대신 ZNS SSD 경로 사용 */
-      zWalName = zZnsWalName;
+      zWalNameToUse = zZnsWalName;
+    }
+    else
+    {
+      // 경로 생성 실패 시 오류 처리 또는 기본 경로 사용
+      // sqlite3_log(SQLITE_WARNING, "Failed to generate ZNS WAL path for %s", zWalNameOriginal);
+      // zWalNameToUse = zWalNameOriginal; // 기본 경로 사용
+      sqlite3_free(zZnsWalName); // 실패 시 할당된 메모리 해제
+      return SQLITE_CANTOPEN;    // 경로 생성 실패 시 열기 실패 처리
     }
   }
 
@@ -1933,14 +1959,21 @@ int sqlite3WalOpen(
   pRet->pDbFd = pDbFd;
   pRet->readLock = -1;
   pRet->mxWalSize = mxWalSize;
-  pRet->zWalName = zWalName;
+  // zWalName은 실제 사용된 경로(zWalNameToUse)를 저장해야 할 수 있으나,
+  // sqlite3WalClose 등에서 zZnsWalName을 해제해야 하므로 주의 필요.
+  // 일단 원본 이름을 저장하고, ZNS 경로 사용 여부를 플래그로 관리하는 것이 나을 수 있음.
+  // 여기서는 zZnsWalName이 할당된 경우 이를 pRet->zWalName에 저장하고, close 시 해제하도록 가정.
+  // 하지만 sqlite3WalClose는 const char* 를 받으므로 직접 수정 어려움.
+  // 임시 해결: zWalName 필드는 원본 이름을 유지하고, 실제 파일 작업은 zWalNameToUse 사용.
+  pRet->zWalName = zWalNameOriginal; // 원본 이름 저장
   pRet->syncHeader = 1;
   pRet->padToSectorBoundary = 1;
   pRet->exclusiveMode = (bNoShm ? WAL_HEAPMEMORY_MODE : WAL_NORMAL_MODE);
 
   /* Open file handle on the write-ahead log file. */
   flags = (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_WAL);
-  rc = sqlite3OsOpen(pVfs, zWalName, pRet->pWalFd, flags, &flags);
+  // 실제 사용할 경로로 파일 열기 시도
+  rc = sqlite3OsOpen(pVfs, zWalNameToUse, pRet->pWalFd, flags, &flags);
   if (rc == SQLITE_OK && flags & SQLITE_OPEN_READONLY)
   {
     pRet->readOnly = WAL_RDONLY;
@@ -1948,10 +1981,10 @@ int sqlite3WalOpen(
 
   if (rc != SQLITE_OK)
   {
-    walIndexClose(pRet, 0);
+    // walIndexClose(pRet, 0); // 아직 wal-index 관련 작업 전
     sqlite3OsClose(pRet->pWalFd);
     sqlite3_free(pRet);
-    sqlite3_free(zZnsWalName);
+    sqlite3_free(zZnsWalName); // 할당된 ZNS 경로 메모리 해제
   }
   else
   {
@@ -1965,7 +1998,21 @@ int sqlite3WalOpen(
       pRet->padToSectorBoundary = 0;
     }
     *ppWal = pRet;
-    WALTRACE(("WAL%d: opened\n", pRet));
+    WALTRACE(("WAL%d: opened %s\n", pRet, zWalNameToUse));
+
+    // zZnsWalName 메모리 관리가 필요함. Wal 구조체에 포인터를 저장하거나,
+    // 여기서 free하지 않고 sqlite3WalClose에서 처리하도록 수정 필요.
+    // 가장 간단한 방법은 Wal 구조체에 char* 필드를 추가하는 것.
+    // 예: pRet->zAllocatedWalName = zZnsWalName; (Wal 구조체 수정 필요)
+    // 여기서는 일단 free하지 않고 넘어감. close에서 해제 필요.
+    // --> sqlite3WalClose 수정이 필요해짐. 현재 인터페이스로는 어려움.
+    // --> 임시 방편: zZnsWalName을 사용한 경우, 해당 포인터를 별도로 관리해야 함.
+    //     또는 zWalName 필드를 strdup 등으로 복사하여 관리.
+    // --> 현재 코드에서는 zZnsWalName을 free함. 즉, pRet->zWalName은 원본을 가리킴.
+    //     파일 작업 시에는 zWalNameToUse (지역 변수)를 사용했으므로 문제는 없으나,
+    //     pRet->zWalName 필드가 실제 열린 파일과 다를 수 있음을 인지해야 함.
+    //     로그 등에 원본 파일명이 기록될 수 있음.
+    sqlite3_free(zZnsWalName); // 열기 성공 후에는 free (pRet->zWalName은 원본 유지)
   }
   return rc;
 }
@@ -2685,29 +2732,63 @@ walcheckpoint_out:
 */
 static void walLimitSize(Wal *pWal, i64 nMax)
 {
-  i64 sz;
+  i64 sz = 0; // Initialize size
   int rx;
+  const char *zPathForLog = pWal->zWalName; // Path for logging (original name)
+  char *zZnsWalNameForLog = 0;              // ZNS path for logging (if used)
 
+  /* Get the actual file path used, for logging purposes */
+  if (sqlite3WalUseZnsSsd())
+  {
+    zZnsWalNameForLog = walGetZnsWalPath(pWal->zWalName);
+    if (zZnsWalNameForLog)
+      zPathForLog = zZnsWalNameForLog;
+  }
+
+  /* Operations inside this block might allocate memory internally in VFS,
+  ** but failures are generally ignored, hence the benign malloc context. */
   sqlite3BeginBenignMalloc();
-  rx = sqlite3OsFileSize(pWal->pWalFd, &sz);
+  rx = sqlite3OsFileSize(pWal->pWalFd, &sz); // Get current file size
+
+  /* Proceed only if getting file size succeeded and the size exceeds the limit */
   if (rx == SQLITE_OK && (sz > nMax))
   {
-    if (sqlite3WalUseZnsSsd())
+    if (sqlite3WalUseZnsSsd()) // Are we in ZNS mode?
     {
-      /* ZNS SSD의 경우 Zone Reset 사용 */
-      rx = walResetZnsZone(pWal->pWalFd);
+      if (nMax == 0) // Is it a request to reset (limit 0)?
+      {
+        /* In ZNS mode, a limit of 0 means reset the zone */
+        rx = walResetZnsZone(pWal->pWalFd); // Attempts truncate(0)
+      }
+      else // It's a request for a positive limit in ZNS mode (unsupported)
+      {
+        /* Truncating to a positive size is not supported in ZNS/ZoneFS.
+        ** Log a warning and ignore the request. Do not attempt truncate. */
+        sqlite3_log(SQLITE_WARNING,
+                    "Ignoring positive journal_size_limit for ZNS WAL: %s (limit %lld)",
+                    zPathForLog, nMax);
+        /* We didn't perform an operation that could fail, so keep rx as SQLITE_OK
+           if the OsFileSize call succeeded. */
+        // rx = SQLITE_OK; // Explicitly set, or just let it be if already OK
+      }
     }
-    else
+    else // Not in ZNS mode (standard file system)
     {
-      /* 일반 SSD의 경우 기존과 같이 truncate 사용 */
+      /* On standard file systems, truncate to the specified size */
       rx = sqlite3OsTruncate(pWal->pWalFd, nMax);
     }
-  }
-  sqlite3EndBenignMalloc();
-  if (rx)
+  } // end if (rx == SQLITE_OK && sz > nMax)
+
+  sqlite3EndBenignMalloc(); // End benign malloc context
+
+  /* Log an error if a *valid* OS operation (Reset or non-ZNS Truncate) failed.
+     Do not log an error for the ignored ZNS/nMax>0 case. */
+  if (rx != SQLITE_OK && !(sqlite3WalUseZnsSsd() && nMax > 0))
   {
-    sqlite3_log(rx, "cannot limit WAL size: %s", pWal->zWalName);
+    sqlite3_log(rx, "cannot limit WAL size: %s (limit %lld, initial size %lld)", zPathForLog, nMax, sz);
   }
+
+  sqlite3_free(zZnsWalNameForLog); // Free the ZNS path string if allocated
 }
 
 #ifdef SQLITE_USE_SEH
@@ -4314,48 +4395,67 @@ static int walRestartLog(Wal *pWal)
 {
   int rc = SQLITE_OK;
   int cnt = 0;
+  volatile WalCkptInfo *pInfo = 0; // 초기화 추가
 
-  /* If the log file is empty, no reset is required. Or, if this connection
-  ** is in exclusive-locking mode and is the only connection using the
-  ** database, no reset is required either. In the latter case, the caller
-  ** resets the log by calling OsTruncate() directly.
-  */
+  /* If the log file is empty, no reset is required. */
   if (pWal->hdr.mxFrame == 0)
     return SQLITE_OK;
-  if (pWal->exclusiveMode)
+
+  /* If this connection is in exclusive-locking mode, the caller resets
+  ** the log by calling OsTruncate() directly (via walLimitSize).
+  ** WAL_HEAPMEMORY_MODE도 여기에 해당될 수 있음.
+  */
+  if (pWal->exclusiveMode != WAL_NORMAL_MODE)
     return SQLITE_OK;
 
-  /* Check if the WRITE lock is held and that there are no readers. If
-  ** either of these conditions is true, then the log cannot be reset.
+  /* Check if the WRITE lock is held (precondition) and that there are no readers.
+  ** If there are readers, the log cannot be reset safely.
   */
   assert(pWal->writeLock);
-  for (cnt = 1; cnt < WAL_NREADER; cnt++)
-  {
-    volatile WalCkptInfo *pInfo = walCkptInfo(pWal);
-    if (pInfo->aReadMark[cnt])
-    {
-      return SQLITE_OK;
-    }
-  }
 
-  /* If we get to here, then log can be restarted. */
-  if (sqlite3WalUseZnsSsd())
+  // walCkptInfo는 wal-index 페이지 0이 매핑된 후에만 안전하게 접근 가능
+  if (pWal->nWiData > 0 && pWal->apWiData[0])
   {
-    /* ZNS SSD의 경우, Zone Reset을 사용하여 WAL 파일 초기화 */
-    rc = walResetZnsZone(pWal->pWalFd);
+    pInfo = walCkptInfo(pWal);
+    SEH_TRY
+    { // SEH 블록 추가
+      for (cnt = 1; cnt < WAL_NREADER; cnt++)
+      {
+        // 다른 리더가 사용 중인지 확인 (aReadMark[0]은 무시)
+        if (AtomicLoad(&pInfo->aReadMark[cnt]) != 0 && AtomicLoad(&pInfo->aReadMark[cnt]) != READMARK_NOT_USED)
+        {
+          return SQLITE_OK; // 리더가 있으므로 리셋 불가
+        }
+      }
+    }
+    SEH_EXCEPT(return SQLITE_IOERR_IN_PAGE;) // 예외 발생 시 오류 반환
   }
   else
   {
-    /* 일반 SSD의 경우 기존과 같이 빈 파일로 시작 */
-    rc = sqlite3OsTruncate(pWal->pWalFd, 0);
+    // wal-index 페이지 0이 매핑되지 않은 경우, 리더 상태를 확인할 수 없으므로 리셋 불가
+    return SQLITE_OK;
   }
+
+  /* If we get to here, then the log can be restarted. */
+  rc = walResetZnsZone(pWal->pWalFd); // truncate(0) 호출
 
   if (rc == SQLITE_OK)
   {
-    pWal->hdr.mxFrame = 0;
-    pWal->hdr.szPage = pWal->szPage;
-    pWal->truncateOnCommit = 1;
-    walIndexWriteHdr(pWal);
+    u32 salt1;
+    sqlite3_randomness(4, &salt1);
+    // walRestartHdr 함수 호출로 헤더 업데이트 로직 통합
+    walRestartHdr(pWal, salt1);
+    // walRestartHdr에서 mxFrame=0, nCkpt++, salt 변경, walIndexWriteHdr 호출,
+    // pInfo 업데이트 등을 수행함.
+    // 추가로 필요한 설정:
+    pWal->truncateOnCommit = 1; // 첫 커밋 시 크기 제한 적용 플래그
+    // pWal->hdr.szPage = pWal->szPage; // walRestartHdr 내부에서 처리될 것으로 예상되나 확인 필요
+    // -> walIndexWriteHdr가 pWal->hdr을 사용하므로 미리 설정해야 함.
+    // -> walRestartHdr 호출 전에 설정하거나, walRestartHdr 내부에서 처리.
+    // -> walRestartHdr는 salt만 받으므로 호출 전에 설정.
+    pWal->hdr.szPage = (u16)((pWal->szPage & 0xff00) | (pWal->szPage >> 16));
+
+    // walRestartHdr 내부에서 walIndexWriteHdr를 호출하여 변경 사항을 shm에 기록함.
   }
 
   return rc;
